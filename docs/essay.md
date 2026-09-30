@@ -18,7 +18,7 @@ Four kinds of numbers appear below, and each one is labeled:
 
 Every response is counted once. A resumed or forked session copies earlier responses into its own transcript file, and those copies are not billed a second time.
 
-Claude Code cost here includes fallback attempts that were declined after they had started streaming output, priced at list rates as if billed. They are 8.9% of it. Every Claude Code share below is of that one total, except the repriced figures in section 1, which say so.
+Claude Code cost here includes fallback attempts that were declined after they had started streaming output, priced at list rates as if billed. They are 8.9% of it. Every Claude Code share below is of that one total.
 
 ## 1. One rule, two different results
 
@@ -34,7 +34,7 @@ On Codex, the replay would have cut 15.4% of cost, in USD at the prices each cal
 
 On Claude Code, the same rule would have cut 7.0%. The rewrite ate 29% of the saving, and the rule stops paying at a 32% re-fetch rate. Count a re-fetch every time the agent later mentions an evicted output, which happens for 60% of them, and it loses 5.9%. That proxy overstates re-fetches, but the real rate would have to be about half of it before the rule broke even. I have no comparable measurement for Codex.
 
-Most of the gap is the shape of the work, not the price sheet. Before any rewrite, eviction would have saved 19.1% on Codex and 9.8% on Claude Code, because my Codex sessions carry more stale tool output to remove. The price ratio then decides how much of that saving the rewrite takes back, and it bites harder on the two Claude models with the cheapest cache reads, Opus 5.5 and Fable 5.1, which served 27% of my Claude Code calls. Priced as if every Claude Code call had run at Opus 5.5 list rates, the zero re-fetch saving falls to 4.7% of that repriced cost. At Fable 5.1 rates it falls to 0.3%.
+Most of the gap is the shape of the work, not the price sheet. Before any rewrite, eviction would have saved 19.1% on Codex and 9.8% on Claude Code, because my Codex sessions carry more stale tool output to remove. The price ratio then decides how much of that saving the rewrite takes back, and it bites harder on the two Claude models with the cheapest cache reads, Opus 5.5 and Fable 5.1, which served 27% of my Claude Code calls.
 
 The mechanism is on the price sheet, and it is not my discovery. Anthropic's own guide to optimizing cost says every context-editing pass invalidates the cached prefix from the point it clears, so the next request pays to cache everything after it again. It reports a 20-issue run where context editing cost 74% more. Yan Song's July 17 paper, Cache-Aware Prompt Compression, shows the same tension for compression on Claude Sonnet 4.6: methods that compress differently for each query produce a new prefix on every call and invalidate the cache each time. What I can add is evidence. One rule, replayed over a large corpus of real coding-agent harness calls from two vendors, would have saved 15.4% on one and 7.0% on the other before any re-fetch, and on the second it loses money at the re-fetch rate a lexical proxy measures.
 
@@ -57,7 +57,7 @@ Prices are from the official pages, read September 30, 2026: platform.claude.com
 
 *Modeled.* Real deletions are spread around that assumption, so here is the spread from my own logs. Across the 4,517 eviction batches the rule made on my Claude Code logs, the tail was a median 0.71 times the size of the evicted block, with the middle half between 0.48 and 1.12. The evicted tokens had a median 36 calls left to live, with the middle half between 15 and 77. Price every one of those batches at a single ratio, with no re-fetch, and the share that pays back falls from 86% at GPT-5.6-sol's 9 to 83% at 11.5 (Sonnet 5's 5-minute cache), 70% at 24 (Opus 5.5) and 50% at 49 (Fable 5.1). At the prices the calls actually paid, which mix models and both cache tiers, it is 76%.
 
-Codex has more to remove. A Codex tool output stays in context for a median 29 more calls (observed), and tool output is 46% of Codex cost-weighted tokens against 18% of Claude Code cost. The rewrite ate 19% of what eviction saved on Codex and 29% on Claude Code, at the prices paid. Repriced, the Claude Code share rises to 46% at Opus 5.5 rates and 94% at Fable 5.1 rates.
+Codex has more to remove. A Codex tool output stays in context for a median 29 more calls (observed), and tool output is 46% of Codex cost-weighted tokens against 18% of Claude Code cost. The rewrite ate 19% of what eviction saved on Codex and 29% on Claude Code, at the prices paid.
 
 Cheaper cache reads are good news for everyone. They also make every deletion harder to pay back.
 
@@ -116,7 +116,7 @@ One note for anyone estimating tokens from characters. Tool output in my Claude 
 
 | Trick | What it does | Net result |
 |---|---|---|
-| Lease eviction | The rule from section 1 | +7.0% before re-fetches, -5.9% at the lexical re-fetch rate (break-even at 32%). Repriced before re-fetches: +4.7% at Opus 5.5 rates, +0.3% at Fable 5.1 rates |
+| Lease eviction | The rule from section 1 | +7.0% before re-fetches, -5.9% at the lexical re-fetch rate (break-even at 32%). |
 | Head/tail admission | Keep the head and tail of a large output, fetch the rest on demand | +1.8% to +2.2%. 64% to 66% of truncated outputs were needed again. Perfect foresight caps it at 5.0% |
 | Hindsight residue | Show a large result once, then keep only the lines the model referenced | Costs 5.5% more than doing nothing on the results it touches |
 | Write-once tool arguments | Replace the agent's own large Write bodies and scripts with a stub after the first send | +3.0% optimistic, -6.8% pessimistic |
