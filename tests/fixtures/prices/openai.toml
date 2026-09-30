@@ -1,0 +1,11 @@
+# Round test prices, USD per MTok. Not real prices.
+snapshot_date = "2000-01-01"
+source_url = "https://developers.openai.com/api/docs/pricing"
+long_context_threshold = 272000
+
+[models."gpt-5.6-sol"]
+input = 4.0
+cached_input = 0.4
+cache_write = 5.0
+output = 20.0
+long_context = { input = 8.0, cached_input = 0.8, cache_write = 10.0, output = 30.0 }
