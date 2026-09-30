@@ -1,0 +1,413 @@
+"""anatomy scan: stream local Claude Code and Codex transcripts and print aggregate totals.
+
+Nothing is sent anywhere. Output passes the privacy gate (privacy.py) before it
+is printed: numbers and fixed labels only.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+import time
+from datetime import datetime, timezone
+from multiprocessing import Pool
+
+from . import __version__, attribute, ledger
+from .ingest import claude as claude_ingest
+from .ingest import codex as codex_ingest
+from .prices import AnthropicPrices, OpenAIPrices
+from .privacy import PrivacyError, assert_clean, gate
+
+# ---------------------------------------------------------------- workers
+_STATE: dict = {}
+
+
+def _init(anthropic_path, openai_path):
+    _STATE['ap'] = AnthropicPrices(anthropic_path)
+    _STATE['op'] = OpenAIPrices(openai_path)
+
+
+def _claude_file(job):
+    """-> (path, agg, (last_ts, message-id digests)) for one transcript."""
+    path, kind, until, copied = job
+    agg = ledger.new_agg()
+    agg['claude_files'][kind] += 1
+    try:
+        th = claude_ingest.read_thread(path, until, copied)
+    except Exception as e:   # never echo content; the type name is enough
+        agg['claude_errors'][type(e).__name__[:40]] += 1
+        return path, agg, (None, [])
+    if th['stopped_at_until'] and th['first_ts'] is None:
+        # the file did not exist yet at the cutoff
+        agg = ledger.new_agg()
+        agg['claude_files_after_until']['files'] += 1
+        return path, agg, (None, [])
+    info = (th['last_ts'], th['ids'])
+    if not th['calls']:
+        agg['claude_files'][kind + ':no_calls'] += 1
+        return path, agg, info
+    ap = _STATE['ap']
+    costs = ledger.claude_thread(th, kind, ap, agg)
+    attribute.claude_thread(th, ap, costs, agg)
+    return path, agg, info
+
+
+def _codex_file(job):
+    """-> (path, agg, (last call timestamp, response-id digests)) for one rollout."""
+    path, until, copied = job
+    agg = ledger.new_agg()
+    agg['codex_files']['all'] += 1
+    try:
+        s = codex_ingest.read_session(path, until, copied)
+    except Exception as e:
+        agg['codex_errors'][type(e).__name__[:40]] += 1
+        return path, agg, (None, [])
+    m = s['meta']
+    if m['truncated_at_until'] and m['lines'] == 0:
+        agg = ledger.new_agg()
+        agg['codex_files_after_until']['files'] += 1
+        return path, agg, (None, [])
+    agg['codex_events']['token_count_raw'] += m['tc_events']
+    agg['codex_events']['token_count_dup_or_empty'] += m['tc_dups']
+    agg['codex_events']['compacted_lines'] += m['compacted_lines']
+    agg['codex_files']['forked_history'] += 1 if s['forked'] else 0
+    agg['codex_files']['source:' + str(m['source'])] += 1
+    op = _STATE['op']
+    ledger.codex_session(s, op, agg)
+    attribute.codex_session(s, op, agg)
+    last = s['live'][-1]['ts'] if s['live'] else None
+    return path, agg, (last, [r['rid'] for r in s['recs'] if r['rid']])
+
+
+def _map(fn, jobs, workers, init_args):
+    if workers <= 1:
+        _init(*init_args)
+        return [fn(j) for j in jobs]
+    with Pool(workers, initializer=_init, initargs=init_args) as pool:
+        return list(pool.imap_unordered(fn, jobs, chunksize=1))
+
+
+def copied_ids(infos: dict) -> dict:
+    """Ids billed in more than one file. The file whose last record is oldest keeps them
+    (a resumed or forked session copies its parent's history, timestamps included);
+    every other file gets them as its copied set. -> {path: frozenset(ids)}"""
+    where: dict = {}
+    for path, (last, hs) in infos.items():
+        for h in set(hs):
+            where.setdefault(h, []).append(path)
+    skip: dict = {}
+    for h, paths in where.items():
+        if len(paths) < 2:
+            continue
+        owner = min(paths, key=lambda p: (infos[p][0] is None, infos[p][0] or 0, p))
+        for p in paths:
+            if p != owner:
+                skip.setdefault(p, set()).add(h)
+    return {p: frozenset(v) for p, v in skip.items()}
+
+
+def _scan(fn, jobs, workers, init_args, dedupe, rerun_job, calls_key, usd_of):
+    """Pass 1 over every file; with global dedupe, re-read only the files holding copied
+    responses, with those responses marked. Returns the merged agg."""
+    results = _map(fn, jobs, workers, init_args)
+    per = {path: agg for path, agg, _ in results}
+    dd = {'files_with_copied_responses': 0, 'calls_removed': 0, 'usd_removed': 0.0}
+    if dedupe == 'global':
+        skip = copied_ids({path: info for path, _, info in results})
+        if skip:
+            again = _map(fn, [rerun_job(p, ids) for p, ids in skip.items()], workers, init_args)
+            for path, agg, _ in again:
+                old = per[path]
+                dd['files_with_copied_responses'] += 1
+                dd['calls_removed'] += sum(old[calls_key].values()) - sum(agg[calls_key].values())
+                dd['usd_removed'] += usd_of(old) - usd_of(agg)
+                per[path] = agg
+    total = ledger.new_agg()
+    for agg in per.values():
+        ledger.merge(total, agg)
+    total['dedupe'].update(dd)
+    return total
+
+
+# ---------------------------------------------------------------- report
+# Every number carries one of four bases:
+#   observed   read directly from transcript usage fields (tokens, calls), or those
+#              usage fields times a published list price
+#   estimated  attribution and token-size estimates
+#   modeled    replayed or counterfactual savings (none in `scan`)
+#   invoiced   vendor invoice or usage-report data (only when the user supplies it)
+BASES = ('observed', 'estimated', 'modeled', 'invoiced')
+LIST_PRICE = 'USD API list-price equivalent'
+
+
+def _r(x, nd=6):
+    return round(float(x), nd)
+
+
+def _share(d: dict, total: float) -> dict:
+    return {k: {'usd': _r(v), 'share': _r(v / total, 6) if total else 0.0} for k, v in sorted(d.items(), key=lambda kv: -kv[1])}
+
+
+def _dd(a) -> dict:
+    return {'basis': 'observed', 'unit': LIST_PRICE,
+            **{k: (_r(v) if isinstance(v, float) else v) for k, v in a['dedupe'].items()}}
+
+
+def claude_report(a) -> dict:
+    usd = a['claude_usd']
+    served = usd['served']
+    billed = usd['declined_billed']
+    entry, carry = a['claude_attr_entry_usd'], a['claude_attr_carry_usd']
+    fine = {k: entry[k] + carry[k] for k in set(entry) | set(carry)}
+    groups: dict = {}
+    for k, v in fine.items():
+        g = attribute.claude_group(k)
+        groups[g] = groups.get(g, 0.0) + v
+    attributed = sum(fine.values())
+    served_input = a['claude_attr_check']['input_usd']
+    by_model = {k.split(':', 1)[1]: _r(sum(v.values())) for k, v in a.items() if k.startswith('claude_usd_model:')}
+    by_kind = {k.split(':', 1)[1]: _r(sum(v.values())) for k, v in a.items() if k.startswith('claude_usd_kind:')}
+    return {
+        'corpus': {
+            'basis': 'observed',
+            'files': sum(v for k, v in a['claude_files'].items() if ':' not in k),
+            'files_after_until': a['claude_files_after_until']['files'],
+            'files_failed': sum(a['claude_errors'].values()),
+            'files_by_kind': dict(a['claude_files']),
+            'threads_with_calls': a['claude_threads']['with_calls'],
+            'calls': sum(a['claude_calls_by_model'].values()),
+            'calls_by_model': dict(a['claude_calls_by_model'].most_common()),
+            'calls_by_kind': dict(a['claude_calls_by_kind'].most_common()),
+        },
+        'tokens_by_tier': {'basis': 'observed', **{k: a['claude_tok_tier'][k] for k in ledger.TIERS}},
+        'list_price_usd': {'basis': 'observed', 'unit': LIST_PRICE,
+                           'served': _r(served), 'declined_billed': _r(billed), 'total': _r(served + billed),
+                           'declined_maybe_billed': _r(usd['declined_maybe_billed']), 'served_input': _r(served_input)},
+        'list_price_usd_by_tier': {'basis': 'observed', 'unit': LIST_PRICE, **{k: _r(a['claude_usd_tier'][k]) for k in ledger.TIERS}},
+        'list_price_usd_by_model': {'basis': 'observed', 'unit': LIST_PRICE, **dict(sorted(by_model.items(), key=lambda kv: -kv[1]))},
+        'list_price_usd_by_kind': {'basis': 'observed', 'unit': LIST_PRICE, **by_kind},
+        'dedupe': _dd(a),
+        'fallback': {'basis': 'observed', **dict(a['claude_fallback']),
+                     'declined_by_model': dict(a['claude_fallback_declined_model'])},
+        'unpriced': {'basis': 'observed', 'calls': a['claude_unpriced']['calls'], 'tokens': a['claude_unpriced']['tokens']},
+        'modifiers': {'basis': 'observed', 'fast_calls': a['claude_modifiers']['fast_calls'],
+                      'us_geo_calls': a['claude_modifiers']['us_geo_calls']},
+        'input_attribution': {
+            'basis': 'estimated', 'unit': LIST_PRICE,
+            'attributed_usd': _r(attributed),
+            'unattributed_usd': _r(served_input - attributed),
+            'by_group': _share(groups, attributed),
+        },
+        'cache_rebuilds': {'basis': 'estimated', 'unit': LIST_PRICE,
+                           **{c: {'events': a['claude_rebuild_events'][c], 'tokens': round(a['claude_rebuild_tokens'][c]),
+                                  'excess_usd': _r(a['claude_rebuild_usd'][c])} for c in attribute.REBUILD_CAUSES}},
+    }
+
+
+def codex_report(a) -> dict:
+    usd = a['codex_usd']
+    rent = a['codex_rent_token_calls']
+    rti = a['codex_rent_check']['input_token_calls']
+    groups: dict = {}
+    gusd: dict = {}
+    for k, v in rent.items():
+        g = attribute.codex_group(k)
+        groups[g] = groups.get(g, 0.0) + v
+        gusd[g] = gusd.get(g, 0.0) + a['codex_rent_usd'][k]
+    tool_kinds = {k.split(':', 1)[1]: {'token_calls_share': _r(v / rti, 6) if rti else 0.0, 'usd': _r(a['codex_rent_usd'][k])}
+                  for k, v in sorted(rent.items(), key=lambda kv: -kv[1]) if k.startswith('tool_output:')}
+    return {
+        'corpus': {
+            'basis': 'observed',
+            'files': a['codex_files']['all'],
+            'files_after_until': a['codex_files_after_until']['files'],
+            'files_failed': sum(a['codex_errors'].values()),
+            'forked_history_sessions': a['codex_files']['forked_history'],
+            'calls': a['codex_calls']['live'],
+            'calls_by_model': dict(a['codex_calls_by_model'].most_common()),
+            'token_count_events_raw': a['codex_events']['token_count_raw'],
+            'token_count_dup_or_empty_dropped': a['codex_events']['token_count_dup_or_empty'],
+            'synthetic_calls_without_response_items': a['codex_calls']['synthetic_without_response_items'],
+            'responses_without_usage': a['codex_calls']['responses_without_usage'],
+        },
+        'tokens': {'basis': 'observed', **dict(a['codex_tok'])},
+        'list_price_usd': {'basis': 'observed', 'unit': LIST_PRICE,
+                           'token_count_calls': _r(usd['token_count_calls']), 'compaction_requests': _r(usd['compaction_requests']),
+                           'total': _r(usd['token_count_calls'] + usd['compaction_requests'])},
+        'list_price_usd_by_part': {'basis': 'observed', 'unit': LIST_PRICE,
+                                   **{k: _r(a['codex_usd_part'][k]) for k in ('cached_in', 'uncached_in', 'out_visible', 'out_reasoning')}},
+        'list_price_usd_by_model': {'basis': 'observed', 'unit': LIST_PRICE, **{k: _r(v) for k, v in a['codex_usd_model'].most_common()}},
+        'dedupe': _dd(a),
+        'compaction_requests': {'basis': 'observed', **dict(a['codex_compaction'])},
+        'long_context': {'basis': 'observed', **dict(a['codex_long_context'])},
+        'unpriced': {'basis': 'observed', 'calls': a['codex_unpriced']['calls'], 'tokens': a['codex_unpriced']['tokens']},
+        'polls': {'basis': 'observed', 'calls': a['codex_polls']['calls'],
+                  'polls_no_input': a['codex_polls']['polls_no_input'],
+                  'polls_no_new_output': a['codex_polls']['polls_no_new_output']},
+        'context_rent': {
+            'basis': 'estimated', 'unit': LIST_PRICE,
+            'input_token_calls': rti,
+            'explained_share': _r(sum(rent.values()) / rti, 6) if rti else 0.0,
+            'modeled_input_usd': _r(sum(a['codex_rent_usd'].values())),
+            'by_group': {g: {'token_calls_share': _r(v / rti, 6) if rti else 0.0, 'usd': _r(gusd[g])}
+                         for g, v in sorted(groups.items(), key=lambda kv: -kv[1])},
+            'tool_output_by_kind': tool_kinds,
+        },
+    }
+
+
+def _money(x):
+    return '${:,.2f}'.format(x)
+
+
+def _pct(x):
+    return '{:.1f}%'.format(100 * x)
+
+
+def _n(x):
+    return format(x, ',')
+
+
+def render_text(rep: dict) -> str:
+    """Lines starting with '#' are metadata. Every other line with a number ends with its basis."""
+    L = []
+    p = rep['prices']
+    L.append('# Anatomy %s scan. Dollars are %s at the price snapshots below.' % (rep['anatomy_version'], LIST_PRICE))
+    L.append('# Prices: Anthropic snapshot %s, OpenAI snapshot %s.' % (p['anthropic']['snapshot_date'], p['openai']['snapshot_date']))
+    if rep.get('until'):
+        L.append('# Records after %s UTC are ignored.' % rep['until'])
+    L.append('# Bases: [observed] transcript usage fields, [estimated] attribution, [modeled] counterfactual, [invoiced] vendor data.')
+    L.append('invoiced totals: not available (no vendor invoice or usage report supplied)  [invoiced]')
+    c = rep.get('claude')
+    if c:
+        co, s = c['corpus'], c['list_price_usd']
+        L.append('')
+        L.append('CLAUDE CODE  %s files, %s threads with calls, %s calls  [observed]' % (_n(co['files']), _n(co['threads_with_calls']), _n(co['calls'])))
+        L.append('  served attempts          %14s  [observed]' % _money(s['served']))
+        L.append('  declined fallbacks       %14s  output streamed before the decline  [observed]' % _money(s['declined_billed']))
+        L.append('  total                    %14s  [observed]' % _money(s['total']))
+        L.append('  declined before output   %14s  may be billed, not in total  [observed]' % _money(s['declined_maybe_billed']))
+        L.append(_dedupe_line(c['dedupe']))
+        L.append('  by tier   ' + '  '.join('%s %s' % (k, _money(v)) for k, v in c['list_price_usd_by_tier'].items() if k not in ('basis', 'unit')) + '  [observed]')
+        L.append('  by kind   ' + '  '.join('%s %s' % (k, _money(v)) for k, v in c['list_price_usd_by_kind'].items() if k not in ('basis', 'unit')) + '  [observed]')
+        for k, v in c['list_price_usd_by_model'].items():
+            if k in ('basis', 'unit'):
+                continue
+            L.append('    %-28s %14s  %s calls  [observed]' % (k, _money(v), _n(co['calls_by_model'].get(k, 0))))
+        ia = c['input_attribution']
+        L.append('  served input %s, attributed %s; share by cause:  [estimated]' % (_money(s['served_input']), _money(ia['attributed_usd'])))
+        for g, v in ia['by_group'].items():
+            if v['share'] >= 0.001:
+                L.append('    %-46s %7s  %14s  [estimated]' % (g, _pct(v['share']), _money(v['usd'])))
+        L.append('  cache rebuilds, excess over a warm read:')
+        for cause, v in c['cache_rebuilds'].items():
+            if cause in ('basis', 'unit'):
+                continue
+            L.append('    %-46s %6s events  %14s  [estimated]' % (cause, _n(v['events']), _money(v['excess_usd'])))
+    x = rep.get('codex')
+    if x:
+        co, s = x['corpus'], x['list_price_usd']
+        L.append('')
+        L.append('CODEX  %s files, %s calls  [observed]' % (_n(co['files']), _n(co['calls'])))
+        L.append('  token_count calls        %14s  [observed]' % _money(s['token_count_calls']))
+        L.append('  compaction requests      %14s  [observed]' % _money(s['compaction_requests']))
+        L.append('  total                    %14s  [observed]' % _money(s['total']))
+        L.append(_dedupe_line(x['dedupe']))
+        L.append('  by part   ' + '  '.join('%s %s' % (k, _money(v)) for k, v in x['list_price_usd_by_part'].items() if k not in ('basis', 'unit')) + '  [observed]')
+        for k, v in x['list_price_usd_by_model'].items():
+            if k in ('basis', 'unit'):
+                continue
+            L.append('    %-28s %14s  %s calls  [observed]' % (k, _money(v), _n(co['calls_by_model'].get(k, 0))))
+        cr = x['context_rent']
+        L.append('  context rent, share of input token-calls (explained %s):  [estimated]' % _pct(cr['explained_share']))
+        for g, v in cr['by_group'].items():
+            L.append('    %-46s %7s  %14s  [estimated]' % (g, _pct(v['token_calls_share']), _money(v['usd'])))
+        pl = x['polls']
+        L.append('  polls %s: sent no input %s, returned no new output %s  [observed]' % (
+            _n(pl['calls']), _n(pl['polls_no_input']), _n(pl['polls_no_new_output'])))
+    return '\n'.join(L) + '\n'
+
+
+def _dedupe_line(d: dict) -> str:
+    if not d.get('files_with_copied_responses'):
+        return '  responses billed in more than one file: 0  [observed]'
+    return '  not counted: %s calls copied into %s resumed or forked files, %s already billed in the original  [observed]' % (
+        _n(d['calls_removed']), d['files_with_copied_responses'], _money(d['usd_removed']))
+
+
+# ---------------------------------------------------------------- entry
+def _parse_until(s):
+    if not s:
+        return None, None
+    d = datetime.fromisoformat(s.replace('Z', '+00:00'))
+    if d.tzinfo is None:
+        d = d.replace(tzinfo=timezone.utc)
+    d = d.astimezone(timezone.utc)
+    return d.timestamp(), d.strftime('%Y-%m-%dT%H:%M:%S')
+
+
+def scan(args) -> dict:
+    until_epoch, until_iso = _parse_until(args.until)
+    init_args = (args.anthropic_prices, args.openai_prices)
+    ap, op = AnthropicPrices(args.anthropic_prices), OpenAIPrices(args.openai_prices)
+    rep = {'anatomy_version': __version__, 'dedupe': args.dedupe,
+           'prices': {'anthropic': {'snapshot_date': ap.snapshot_date, 'source_url': ap.source_url},
+                      'openai': {'snapshot_date': op.snapshot_date, 'source_url': op.source_url}},
+           'until': until_iso,
+           'invoiced': {'basis': 'invoiced', 'status': 'not available'}}
+    workers = args.workers or max(1, (os.cpu_count() or 2) - 1)
+    t0 = time.time()
+    if not args.no_claude:
+        root = os.path.expanduser(args.claude_dir or claude_ingest.default_root())
+        files = claude_ingest.discover(root) if os.path.isdir(root) else []
+        files.sort(key=lambda pk: -os.path.getsize(pk[0]))
+        kinds = dict(files)
+        a = _scan(_claude_file, [(p, k, until_epoch, None) for p, k in files], workers, init_args, args.dedupe,
+                  lambda p, ids: (p, kinds[p], until_epoch, ids), 'claude_calls_by_model',
+                  lambda g: g['claude_usd']['served'] + g['claude_usd']['declined_billed'])
+        rep['claude'] = claude_report(a)
+    if not args.no_codex:
+        root = os.path.expanduser(args.codex_dir or codex_ingest.default_root())
+        files = codex_ingest.discover(root) if os.path.isdir(root) else []
+        files.sort(key=lambda p: -os.path.getsize(p))
+        a = _scan(_codex_file, [(p, until_iso, None) for p in files], workers, init_args, args.dedupe,
+                  lambda p, ids: (p, until_iso, ids), 'codex_calls_by_model',
+                  lambda g: g['codex_usd']['token_count_calls'] + g['codex_usd']['compaction_requests'])
+        rep['codex'] = codex_report(a)
+    rep['runtime'] = {'basis': 'observed', 'seconds': round(time.time() - t0, 1)}
+    return rep
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(prog='anatomy', description='Cache-correct cost audit of local Claude Code and Codex transcripts.')
+    ap.add_argument('--version', action='version', version='anatomy ' + __version__)
+    sub = ap.add_subparsers(dest='cmd', required=True)
+    s = sub.add_parser('scan', help='stream transcripts and print aggregate totals')
+    s.add_argument('--claude-dir', help='Claude Code projects directory (default ~/.claude/projects)')
+    s.add_argument('--codex-dir', help='Codex home or sessions directory (default ~/.codex: sessions/ and archived_sessions/)')
+    s.add_argument('--json', action='store_true', help='print JSON instead of text')
+    s.add_argument('--until', help='ignore records stamped after this ISO time (UTC if no offset)')
+    s.add_argument('--no-claude', action='store_true')
+    s.add_argument('--no-codex', action='store_true')
+    s.add_argument('--workers', type=int, default=0, help='worker processes (default: CPU count - 1)')
+    s.add_argument('--dedupe', choices=('global', 'file'), default='global',
+                   help='global (default): bill each message/response id once across all files. '
+                        'file: dedupe within each file only, as the first analyzers did')
+    s.add_argument('--anthropic-prices', help=argparse.SUPPRESS)
+    s.add_argument('--openai-prices', help=argparse.SUPPRESS)
+    args = ap.parse_args(argv)
+    rep = scan(args)
+    try:
+        gate(rep)
+        out = json.dumps(rep, indent=1) + '\n' if args.json else render_text(rep)
+        assert_clean(out)
+    except PrivacyError as e:
+        sys.stderr.write('anatomy: output withheld by the privacy gate (%s)\n' % e)
+        return 3
+    sys.stdout.write(out)
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())
