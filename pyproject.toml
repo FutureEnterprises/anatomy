@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agent-anatomy"
+dynamic = ["version"]
+description = "Local, cache-correct cost audit of Claude Code and Codex transcripts"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+requires-python = ">=3.12"
+dependencies = []
+
+[project.scripts]
+anatomy = "anatomy.cli:main"
+
+[tool.setuptools.dynamic]
+version = { attr = "anatomy.__version__" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+"anatomy.prices" = ["*.toml"]
