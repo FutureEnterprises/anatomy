@@ -1,7 +1,13 @@
-"""anatomy scan: stream local Claude Code and Codex transcripts and print aggregate totals.
+"""anatomy: stream local Claude Code and Codex transcripts and print aggregates.
+
+  scan    the bill, rebuilt from every billed attempt, and where the input dollars went
+  audit   the scan plus the audits: break-even, boot scope, keep-alive, polls, oversized
+          outputs and batched clearing, each with at most one fix
+  card    a numbers-only card: top three fixes that clear break-even at your prices and
+          the one popular trick that would cost you money (text, JSON or SVG)
 
 Nothing is sent anywhere. Output passes the privacy gate (privacy.py) before it
-is printed: numbers and fixed labels only.
+is printed or written: numbers and fixed labels only.
 """
 from __future__ import annotations
 
@@ -13,19 +19,22 @@ import time
 from datetime import datetime, timezone
 from multiprocessing import Pool
 
-from . import __version__, attribute, ledger
+from . import __version__, attribute, audits, breakeven, ledger
+from . import card as card_mod
 from .ingest import claude as claude_ingest
 from .ingest import codex as codex_ingest
 from .prices import AnthropicPrices, OpenAIPrices
-from .privacy import PrivacyError, assert_clean, gate
+from .privacy import PrivacyError, assert_clean, gate, model_label
 
 # ---------------------------------------------------------------- workers
 _STATE: dict = {}
 
 
-def _init(anthropic_path, openai_path):
+def _init(anthropic_path, openai_path, audit=False):
     _STATE['ap'] = AnthropicPrices(anthropic_path)
     _STATE['op'] = OpenAIPrices(openai_path)
+    _STATE['audit'] = audit
+    _STATE['ratios'] = breakeven.ratio_set(_STATE['ap'], _STATE['op'])
 
 
 def _claude_file(job):
@@ -50,7 +59,27 @@ def _claude_file(job):
     ap = _STATE['ap']
     costs = ledger.claude_thread(th, kind, ap, agg)
     attribute.claude_thread(th, ap, costs, agg)
+    if _STATE.get('audit'):
+        audits.claude_thread(th, kind, ap, costs, agg, _STATE['ratios'])
     return path, agg, info
+
+
+def read_codex(path, until=None, copied=None):
+    """codex ingest read_session(), also returning the event list the polls audit links against.
+    Kept equal to read_session() by a test."""
+    ev, meta = codex_ingest.scan(path, until)
+    s = codex_ingest.fold(ev)
+    if copied:
+        for r in s['recs']:
+            if r['rid'] in copied and r['match'] is not None:
+                s['live'][r['match']]['copied'] = True
+        s['recs'] = [r for r in s['recs'] if not (r['rid'] in copied and r['match'] is None)]
+    for c in s['live']:
+        c['model'] = model_label(c['model']) if c['model'] is not None else None
+    for r in s['recs']:
+        r['model'] = model_label(r['model']) if r['model'] is not None else None
+    s['meta'] = meta
+    return s, ev
 
 
 def _codex_file(job):
@@ -59,7 +88,7 @@ def _codex_file(job):
     agg = ledger.new_agg()
     agg['codex_files']['all'] += 1
     try:
-        s = codex_ingest.read_session(path, until, copied)
+        s, ev = read_codex(path, until, copied)
     except Exception as e:
         agg['codex_errors'][type(e).__name__[:40]] += 1
         return path, agg, (None, [])
@@ -74,8 +103,10 @@ def _codex_file(job):
     agg['codex_files']['forked_history'] += 1 if s['forked'] else 0
     agg['codex_files']['source:' + str(m['source'])] += 1
     op = _STATE['op']
-    ledger.codex_session(s, op, agg)
+    costs = ledger.codex_session(s, op, agg)
     attribute.codex_session(s, op, agg)
+    if _STATE.get('audit'):
+        audits.codex_session(s, ev, op, costs, agg, _STATE['ratios'])
     last = s['live'][-1]['ts'] if s['live'] else None
     return path, agg, (last, [r['rid'] for r in s['recs'] if r['rid']])
 
@@ -133,12 +164,12 @@ def _scan(fn, jobs, workers, init_args, dedupe, rerun_job, calls_key, usd_of):
 # ---------------------------------------------------------------- report
 # Every number carries one of four bases:
 #   observed   read directly from transcript usage fields (tokens, calls), or those
-#              usage fields times a published list price
+#              usage fields times a published list price, or the published prices themselves
 #   estimated  attribution and token-size estimates
 #   modeled    replayed or counterfactual savings (none in `scan`)
 #   invoiced   vendor invoice or usage-report data (only when the user supplies it)
 BASES = ('observed', 'estimated', 'modeled', 'invoiced')
-LIST_PRICE = 'USD API list-price equivalent'
+LIST_PRICE = audits.LIST_PRICE
 
 
 def _r(x, nd=6):
@@ -258,7 +289,7 @@ def codex_report(a) -> dict:
 
 
 def _money(x):
-    return '${:,.2f}'.format(x)
+    return ('-$' if x < 0 else '$') + '{:,.2f}'.format(abs(x))
 
 
 def _pct(x):
@@ -336,6 +367,74 @@ def _dedupe_line(d: dict) -> str:
         _n(d['calls_removed']), d['files_with_copied_responses'], _money(d['usd_removed']))
 
 
+# ---------------------------------------------------------------- audit text
+AUDIT_TITLES = (('breakeven', 'BREAK-EVEN'), ('boot_scope', 'BOOT SCOPE'), ('keepalive', 'KEEP-ALIVE'),
+                ('polls', 'POLLS'), ('oversized', 'OVERSIZED TOOL OUTPUTS'), ('clearing', 'BATCHED CLEARING'))
+
+
+def _fmt(k, v):
+    if isinstance(v, bool) or v is None:
+        return '%s %s' % (k, {True: 'yes', False: 'no', None: 'n/a'}[v])
+    parts = set(k.replace('.', '_').split('_'))
+    if isinstance(v, float) and 'usd' in parts:
+        return '%s %s' % (k, _money(v))
+    if isinstance(v, float) and (parts & {'share', 'rate'} or '.R' in k):
+        return '%s %s' % (k, _pct(v))
+    if isinstance(v, (int, float)):
+        return '%s %s' % (k, _n(v) if isinstance(v, int) else format(v, ',.4g'))
+    return '%s %s' % (k, v)
+
+
+def _flat(d, pre=''):
+    for k, v in d.items():
+        if k in ('basis', 'unit', 'id'):
+            continue
+        if isinstance(v, dict):
+            yield from _flat(v, pre + k + '.')
+        else:
+            yield pre + k, v
+
+
+def _section_lines(name, d, basis, per_line=4):
+    pairs = [_fmt(k, v) for k, v in _flat(d)]
+    out = []
+    for i in range(0, len(pairs), per_line):
+        out.append('  %s%s  [%s]' % ((name + ': ') if i == 0 else '    ', ', '.join(pairs[i:i + per_line]), basis))
+    return out
+
+
+def render_audit_text(rep: dict) -> str:
+    """Every line with a number ends with its basis."""
+    au = rep['audits']
+    p = rep['prices']
+    L = ['# Anatomy %s audit. Dollars are %s at the price snapshots below.' % (rep['anatomy_version'], LIST_PRICE),
+         '# Prices: Anthropic snapshot %s, OpenAI snapshot %s.' % (p['anthropic']['snapshot_date'], p['openai']['snapshot_date']),
+         '# Rule: evicting b tokens pays only if b x L x r > S x (w - r) + expected re-fetch cost.',
+         '# Bases: [observed] transcript usage and published prices, [estimated] attribution and sizes, '
+         '[modeled] counterfactual savings, [invoiced] vendor data.']
+    L += _section_lines('sample', au['sample'], 'observed')
+    for key, title in AUDIT_TITLES:
+        sec = au[key]
+        L.append('')
+        L.append(title)
+        for name, d in sec.items():
+            if name in ('fix', 'trick') or not isinstance(d, dict):
+                continue
+            L += _section_lines(name, d, d.get('basis', 'modeled'))
+        f = sec.get('fix')
+        if f:
+            L.append('  fix: %s  [modeled]' % audits.fix_text(f))
+            L.append('    net %s at your prices%s  [modeled]' % (_money(f['net_usd']), ', an upper bound' if f['upper_bound'] else ''))
+        else:
+            L.append('  fix: none clears break-even at your prices')
+        t = sec.get('trick')
+        if t and t['evaluated']:
+            L.append('  popular trick: %s, net %s at your prices%s  [modeled]' % (
+                audits.trick_text(t), _money(t['net_usd']),
+                ', before re-fetches (an upper bound)' if t.get('zero_refetch') else ''))
+    return '\n'.join(L) + '\n'
+
+
 # ---------------------------------------------------------------- entry
 def _parse_until(s):
     if not s:
@@ -349,7 +448,9 @@ def _parse_until(s):
 
 def scan(args) -> dict:
     until_epoch, until_iso = _parse_until(args.until)
-    init_args = (args.anthropic_prices, args.openai_prices)
+    audit = getattr(args, 'audit', False)
+    init_args = (args.anthropic_prices, args.openai_prices, audit)
+    merged = ledger.new_agg()
     ap, op = AnthropicPrices(args.anthropic_prices), OpenAIPrices(args.openai_prices)
     rep = {'anatomy_version': __version__, 'dedupe': args.dedupe,
            'prices': {'anthropic': {'snapshot_date': ap.snapshot_date, 'source_url': ap.source_url},
@@ -367,6 +468,7 @@ def scan(args) -> dict:
                   lambda p, ids: (p, kinds[p], until_epoch, ids), 'claude_calls_by_model',
                   lambda g: g['claude_usd']['served'] + g['claude_usd']['declined_billed'])
         rep['claude'] = claude_report(a)
+        ledger.merge(merged, a)
     if not args.no_codex:
         root = os.path.expanduser(args.codex_dir or codex_ingest.default_root())
         files = codex_ingest.discover(root) if os.path.isdir(root) else []
@@ -375,18 +477,16 @@ def scan(args) -> dict:
                   lambda p, ids: (p, until_iso, ids), 'codex_calls_by_model',
                   lambda g: g['codex_usd']['token_count_calls'] + g['codex_usd']['compaction_requests'])
         rep['codex'] = codex_report(a)
+        ledger.merge(merged, a)
+    if audit:
+        rep['audits'] = audits.report(merged, ap, op)
     rep['runtime'] = {'basis': 'observed', 'seconds': round(time.time() - t0, 1)}
     return rep
 
 
-def main(argv=None) -> int:
-    ap = argparse.ArgumentParser(prog='anatomy', description='Cache-correct cost audit of local Claude Code and Codex transcripts.')
-    ap.add_argument('--version', action='version', version='anatomy ' + __version__)
-    sub = ap.add_subparsers(dest='cmd', required=True)
-    s = sub.add_parser('scan', help='stream transcripts and print aggregate totals')
+def _corpus_args(s):
     s.add_argument('--claude-dir', help='Claude Code projects directory (default ~/.claude/projects)')
     s.add_argument('--codex-dir', help='Codex home or sessions directory (default ~/.codex: sessions/ and archived_sessions/)')
-    s.add_argument('--json', action='store_true', help='print JSON instead of text')
     s.add_argument('--until', help='ignore records stamped after this ISO time (UTC if no offset)')
     s.add_argument('--no-claude', action='store_true')
     s.add_argument('--no-codex', action='store_true')
@@ -396,15 +496,44 @@ def main(argv=None) -> int:
                         'file: dedupe within each file only, as the first analyzers did')
     s.add_argument('--anthropic-prices', help=argparse.SUPPRESS)
     s.add_argument('--openai-prices', help=argparse.SUPPRESS)
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(prog='anatomy', description='Cache-correct cost audit of local Claude Code and Codex transcripts.')
+    ap.add_argument('--version', action='version', version='anatomy ' + __version__)
+    sub = ap.add_subparsers(dest='cmd', required=True)
+    s = sub.add_parser('scan', help='stream transcripts and print aggregate totals')
+    _corpus_args(s)
+    s.add_argument('--json', action='store_true', help='print JSON instead of text')
+    a = sub.add_parser('audit', help='the scan plus every audit, each with at most one fix')
+    _corpus_args(a)
+    a.add_argument('--json', action='store_true', help='print JSON instead of text')
+    c = sub.add_parser('card', help='numbers-only card: top three fixes and the one trick that would cost you money')
+    _corpus_args(c)
+    c.add_argument('--json', action='store_true', help='print the card as JSON instead of text')
+    c.add_argument('--svg', metavar='FILE', help='also write the card as an SVG image to FILE')
     args = ap.parse_args(argv)
+    args.audit = args.cmd in ('audit', 'card')
     rep = scan(args)
+    svg = None
     try:
         gate(rep)
-        out = json.dumps(rep, indent=1) + '\n' if args.json else render_text(rep)
+        if args.cmd == 'card':
+            cd = card_mod.build(rep)
+            out = json.dumps(cd, indent=1) + '\n' if args.json else card_mod.render_text(cd)
+            if args.svg:
+                svg = card_mod.render_svg(cd)
+        elif args.cmd == 'audit':
+            out = json.dumps(rep, indent=1) + '\n' if args.json else render_audit_text(rep)
+        else:
+            out = json.dumps(rep, indent=1) + '\n' if args.json else render_text(rep)
         assert_clean(out)
     except PrivacyError as e:
         sys.stderr.write('anatomy: output withheld by the privacy gate (%s)\n' % e)
         return 3
+    if svg is not None:
+        with open(args.svg, 'w', encoding='utf-8') as fh:
+            fh.write(svg)
     sys.stdout.write(out)
     return 0
 
