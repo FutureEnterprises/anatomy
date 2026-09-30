@@ -45,11 +45,23 @@ def discover(root: str) -> list[tuple[str, str]]:
 
 # ---------------------------------------------------------------- labels
 TASK_TOOLS = {'TaskCreate', 'TaskUpdate', 'TaskOutput', 'TaskStop', 'TaskList', 'TaskGet'}
-_BUILTIN = re.compile(r'^[A-Z][A-Za-z]{1,40}$')
+# Built-in Claude Code tool names. A tool name is printed only when it is on this list; any other name
+# (a user's own tool, an SDK tool, a plugin) is 'other', so a private tool name never reaches the output.
+BUILTIN_TOOLS = frozenset({
+    'Bash', 'BashOutput', 'KillShell', 'KillBash', 'Read', 'Write', 'Edit', 'MultiEdit', 'Glob', 'Grep', 'LS',
+    'NotebookEdit', 'NotebookRead', 'WebFetch', 'WebSearch', 'TodoWrite', 'TodoRead', 'Skill', 'SlashCommand',
+    'ToolSearch', 'ExitPlanMode', 'EnterPlanMode', 'AskUserQuestion', 'StructuredOutput', 'Workflow', 'Monitor',
+    'SendMessage', 'ListAgents', 'SendUserFile', 'SendUserMessage', 'ScheduleWakeup', 'PushNotification',
+    'ReportFindings', 'Artifact', 'ArtifactComments', 'ArtifactData', 'CronCreate', 'CronDelete', 'CronList',
+    'EnterWorktree', 'ExitWorktree', 'ListMcpResourcesTool', 'ReadMcpResourceTool', 'ReadMcpResourceDirTool',
+    'RemoteTrigger', 'ListSkills', 'SearchSkills', 'SuggestSkills', 'ListPlugins', 'SearchPlugins',
+    'SuggestPluginInstall', 'DesignSync', 'LSP',
+})
 
 
 def tool_category(name) -> str:
-    """Built-in tool names are kept; every MCP server and connector collapses to 'mcp'."""
+    """A built-in tool name from BUILTIN_TOOLS; every MCP server and connector collapses to 'mcp'; any
+    other name is 'other'."""
     if not name or not isinstance(name, str):
         return 'unknown'
     if name.startswith('mcp__'):
@@ -58,7 +70,7 @@ def tool_category(name) -> str:
         return 'Agent'
     if name in TASK_TOOLS:
         return 'TaskTools'
-    return name if _BUILTIN.match(name) else 'other'
+    return name if name in BUILTIN_TOOLS else 'other'
 
 
 BASH_RULES = [

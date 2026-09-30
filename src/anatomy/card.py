@@ -1,4 +1,4 @@
-"""The share card: numbers only, the user's top three fixes and the one popular trick that would cost them money.
+"""The share card: numbers only, the user's top three fixes and the one evaluated trick that would have cost them money.
 
 Built from a scan report that carries audits. The card holds numbers, fixed
 labels and the price snapshot dates; the sentences come from a fixed vocabulary
@@ -17,9 +17,11 @@ TEXT_PARAMS = ('cap_minutes_5m', 'cap_tokens', 'batch_tokens', 'vendors', 'break
 
 def build(rep: dict) -> dict:
     au = rep['audits']
-    claude = (rep.get('claude') or {}).get('list_price_usd', {}).get('total', 0.0)
+    c = rep.get('claude') or {}
+    served = c.get('list_price_usd', {}).get('served', 0.0)
+    declined = c.get('declined_fallbacks_usd', {}).get('declined_billed', 0.0)
     codex = (rep.get('codex') or {}).get('list_price_usd', {}).get('total', 0.0)
-    spend = claude + codex
+    spend = served + declined + codex
     fixes = []
     for f in A.top_fixes(au):
         if round(f['net_usd'], 2) <= 0:
@@ -44,7 +46,8 @@ def build(rep: dict) -> dict:
         'unit': A.LIST_PRICE,
         'prices': {'anthropic_snapshot': rep['prices']['anthropic']['snapshot_date'],
                    'openai_snapshot': rep['prices']['openai']['snapshot_date']},
-        'spend': {'basis': 'observed', 'claude_usd': round(claude, 2), 'codex_usd': round(codex, 2)},
+        'spend': {'basis': 'observed', 'claude_served_usd': round(served, 2), 'codex_usd': round(codex, 2)},
+        'spend_declined': {'basis': 'estimated', 'claude_declined_fallbacks_usd': round(declined, 2), 'billing_assumed': True},
         'fixes': fixes,
         'costly_trick': trick,
         'eviction_payback': ev,
@@ -67,19 +70,23 @@ def lines(card: dict) -> list:
     R = [('title', 'ANATOMY CARD'),
          ('meta', 'Dollars are %s, not an invoice. Prices: Anthropic %s, OpenAI %s.' % (
              card['unit'], card['prices']['anthropic_snapshot'], card['prices']['openai_snapshot'])),
-         ('row', 'Spend read: Claude Code %s, Codex %s  [observed]' % (
-             _money(card['spend']['claude_usd']), _money(card['spend']['codex_usd'])))]
+         ('row', 'Spend read: Claude Code %s served, Codex %s  [observed]' % (
+             _money(card['spend']['claude_served_usd']), _money(card['spend']['codex_usd'])))]
+    dc = card['spend_declined']['claude_declined_fallbacks_usd']
+    if dc:
+        R.append(('note', 'Plus %s of declined Claude Code fallback attempts, billing assumed, included in spend read  [estimated]'
+                  % _money(dc)))
     R.append(('head', 'TOP FIXES THAT CLEAR BREAK-EVEN AT YOUR PRICES'))
     if not card['fixes']:
         R.append(('row', 'None of the audited fixes clears break-even at your prices.'))
     for i, f in enumerate(card['fixes'], 1):
         R.append(('row', '%d. %s  [modeled]' % (i, A.fix_text(f))))
-        R.append(('note', '   saves %s, %s of spend read  [modeled]' % (_money(f['net_usd']), _pct(f['share_of_spend']))))
-    R.append(('head', 'THE POPULAR TRICK THAT WOULD COST YOU MONEY'))
+        R.append(('note', '   would have saved %s in replay, %s of spend read  [modeled]' % (_money(f['net_usd']), _pct(f['share_of_spend']))))
+    R.append(('head', 'THE EVALUATED TRICK THAT WOULD HAVE COST YOU MONEY'))
     t = card['costly_trick']
     if t:
         R.append(('row', A.trick_text(t) + '  [modeled]'))
-        R.append(('note', '   costs %s, %s of spend read%s  [modeled]' % (
+        R.append(('note', '   would have cost %s in replay, %s of spend read%s  [modeled]' % (
             _money(-t['net_usd']), _pct(-t['share_of_spend']) if t['share_of_spend'] is not None else 'n/a',
             ', even with no re-fetches' if t['zero_refetch'] else '')))
     else:

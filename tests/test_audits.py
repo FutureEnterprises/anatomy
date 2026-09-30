@@ -10,7 +10,7 @@ from tests.fixtures.make_fixtures import PLANTED
 from tests.helpers import ANTHROPIC_PRICES, CLAUDE_DIR, CODEX_DIR, FIX, OPENAI_PRICES
 from tests.synth import AP, M, OP, attachment, call, poll_session, prompt, thread, tool_result, two_batch_thread
 from tests.test_labels import numeric_leaves
-from anatomy import audits, breakeven as be, cli
+from anatomy import audits, breakeven as be, cli, ledger
 from anatomy.audits import boot_scope, clearing, keepalive, oversized, polls
 from anatomy.cli import BASES
 from anatomy.ingest import codex as codex_ingest
@@ -127,6 +127,20 @@ class Polls(unittest.TestCase):
         self.assertAlmostEqual(bw['cache_penalty_usd'], pen)
         self.assertAlmostEqual(rep['fix']['net_usd'], 0.05 - pen)
 
+    def test_polls_emitted_by_copied_calls_are_not_counted(self):
+        s, ev = poll_session()
+        s = codex_ingest.fold(ev + [('recu', 1000, 0, 0, 10, 0, 'h1')])   # ties to call 0, which emitted poll c1
+        self.assertEqual((s['polls'], s['polls_no_input'], s['polls_no_new_output']), (3, 3, 2))
+        codex_ingest.mark_copied(s, frozenset(['h1']))
+        self.assertTrue(s['live'][0]['copied'])
+        self.assertEqual((s['polls'], s['polls_no_input'], s['polls_no_new_output']), (2, 2, 1))
+        agg = new_agg()
+        ledger.codex_session(s, OP, agg)
+        polls.codex(s, ev, OP, [None, 0.02, 0.03, 0.04], agg)
+        self.assertEqual((agg['codex_polls']['calls'], agg['codex_polls']['polls_no_input'],
+                          agg['codex_polls']['polls_no_new_output']), (2, 2, 1))
+        self.assertEqual(polls.report(agg)['codex_polls']['polls'], 2)
+
     def test_unlinked_session_is_counted_not_guessed(self):
         s, ev = poll_session()
         ev = [e for e in ev if not (e[0] == 'out' and e[1] == 'c3')]
@@ -174,6 +188,40 @@ class Clearing(unittest.TestCase):
         self.assertTrue(rep['trick']['evaluated'])
         self.assertAlmostEqual(rep['trick']['net_usd'], net, places=5)
         self.assertEqual(audits.costly_trick({'clearing': rep})['id'], 'clear_tool_outputs_small_batches')
+
+    def _agg(self, net, unit):
+        agg = new_agg()
+        a = agg['be:' + clearing.key('claude', 60_000)]
+        a['batches'], a['tokens'], a['net_usd'], a['refetch_unit_usd'] = 1, 60_000.0, net, unit
+        return agg
+
+    def test_fix_only_when_breakeven_clears_the_reference_rate(self):
+        # break-even 90%: well past the 60% lexical reference plus the margin, so it is a fix
+        rep = clearing.report(self._agg(9.0, 10.0), ())
+        self.assertEqual(rep['fix']['breakeven_refetch_rate'], 0.9)
+        self.assertNotIn('not_recommended', rep)
+        # break-even 30%: positive before re-fetches, but a re-fetch rate the corpus exceeds erases it
+        rep = clearing.report(self._agg(3.0, 10.0), ())
+        self.assertIsNone(rep['fix'])
+        nr = rep['not_recommended']
+        self.assertEqual((nr['breakeven_refetch_rate'], nr['reference_refetch_rate'], nr['batch_tokens']), (0.3, 0.6, 60_000))
+        text = audits.not_recommended_text(nr)
+        self.assertIn('30%', text)
+        self.assertIn('60%', text)
+        self.assertNotIn('—', text)
+        self.assertEqual(audits.top_fixes({'clearing': rep}), [])
+
+    def test_audit_text_prints_the_verdict(self):
+        rep = {'anatomy_version': 'x', 'prices': {'anthropic': {'snapshot_date': '2026-09-30', 'source_url': 'u1'},
+                                                  'openai': {'snapshot_date': '2026-09-30', 'source_url': 'u2'}},
+               'audits': {'sample': {'basis': 'observed', 'threads': 1}}}
+        for k, _ in cli.AUDIT_TITLES:
+            rep['audits'][k] = {'fix': None}
+        rep['audits']['clearing'] = clearing.report(self._agg(3.0, 10.0), ())
+        out = cli.render_audit_text(rep)
+        self.assertIn('fix: none recommended. Batched clearing (60K batches) stops paying once 30%', out)
+        self.assertNotIn('popular', out)
+        self.assertIn('trick evaluated: Clearing old tool outputs', out)
 
 
 class Ranking(unittest.TestCase):

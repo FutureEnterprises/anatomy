@@ -21,18 +21,22 @@ MIN_THREADS, MIN_SESSIONS = 20, 5   # privacy rule 2: no shared aggregate below 
 LEASE = {'K_calls': 3, 'batch_tokens': 30_000, 'min_output_tokens': 500}
 
 FIX_TEXT = {
-    'boot_listings_on_demand': 'Start subagents with only the tools their task needs and without the skill and '
-                               'deferred-tool listings; load those on demand.',
+    'boot_listings_on_demand': 'Start subagents without the listings they never use (skills, deferred tools, MCP '
+                               'instructions) and load those on demand.',
     'keepalive_capped': 'Keep the cache warm through idle gaps only up to the break-even cap{cap}, then let it expire.',
     'codex_blocking_waits': 'Let Codex wait for a running command to print or exit instead of polling it on a short timer.',
     'cap_large_tool_outputs': 'Cap tool outputs{where} at about {cap_k}K tokens, keep the head and the tail, and read the rest on demand.',
     'batched_clearing': 'Clear old tool outputs only in batches of {batch_k}K tokens or more; this pays only while fewer '
-                        'than {pstar} of the cleared tokens are ever fetched back.',
+                        'than {pstar} of the cleared outputs are ever fetched back.',
+}
+NOT_RECOMMENDED_TEXT = {
+    'batched_clearing': 'Batched clearing ({batch_k}K batches) stops paying once {pstar} of the cleared outputs are '
+                        'fetched back, and a lexical proxy put that share at {ref} on the corpus behind this project.',
 }
 TRICK_TEXT = {
     'evict_old_tool_results': 'Pruning old tool outputs as you go (3 calls old, 30K-token batches)',
     'clear_tool_outputs_small_batches': 'Clearing old tool outputs in small batches (20K tokens, 100K trigger)',
-    'keepalive_always_on': 'Keeping the cache warm through every idle gap',
+    'keepalive_always_on': 'Uncapped keep-alive through every idle gap',
 }
 
 
@@ -135,7 +139,7 @@ def top_fixes(audits: dict, n: int = 3) -> list:
 
 
 def costly_trick(audits: dict):
-    """The popular trick that loses the most money at the user's prices, or None."""
+    """The evaluated trick that loses the most money at the user's prices, or None."""
     tr = [sec['trick'] for sec in audits.values() if isinstance(sec, dict) and isinstance(sec.get('trick'), dict)]
     tr = [t for t in tr if t['evaluated'] and t['net_usd'] < 0]
     return min(tr, key=lambda t: t['net_usd']) if tr else None
@@ -156,3 +160,9 @@ def fix_text(f: dict) -> str:
 
 def trick_text(t: dict) -> str:
     return TRICK_TEXT[t['id']]
+
+
+def not_recommended_text(d: dict) -> str:
+    return NOT_RECOMMENDED_TEXT[d['id']].format(batch_k=d.get('batch_tokens', 0) // 1000,
+                                                pstar='{:.0f}%'.format(100 * d['breakeven_refetch_rate']),
+                                                ref='{:.0f}%'.format(100 * d['reference_refetch_rate']))

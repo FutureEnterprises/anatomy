@@ -75,23 +75,35 @@ def classify_cmd(cmd, parsed_types) -> str:
     return 'other'
 
 
-_FN_NAME = re.compile(r'^[a-z][a-z0-9_]{0,39}$')
-_NS_NAME = re.compile(r'^[a-z][a-z0-9_]{0,39}$')
+# Built-in Codex function tools, as '<namespace>.<name>' or '<name>'. A tool name is printed only when it
+# is on this list: any other function (a user's own tool, a plugin, an unknown namespace) is 'fn:other',
+# so a private tool or namespace name never reaches the output.
+CODEX_FUNCTIONS = frozenset({
+    'shell', 'shell_command', 'exec_command', 'local_shell', 'container.exec', 'write_stdin', 'apply_patch',
+    'update_plan', 'view_image', 'web_search', 'wait', 'get_goal', 'request_permissions', 'request_user_input',
+    'request_user_input_async', 'send_user_message_async', 'list_mcp_resources', 'list_mcp_resource_templates',
+    'read_mcp_resource', 'spawn_agent', 'send_input', 'resume_agent', 'wait_agent', 'close_agent',
+    'clock.sleep', 'codex_app.load_workspace_dependencies', 'codex_app.read_thread_terminal',
+    'collaboration.followup_task', 'collaboration.interrupt_agent', 'collaboration.list_agents',
+    'collaboration.send_message', 'collaboration.spawn_agent', 'collaboration.wait_agent', 'image_gen.imagegen',
+    'multi_agent_v1.close_agent', 'multi_agent_v1.resume_agent', 'multi_agent_v1.send_input',
+    'multi_agent_v1.spawn_agent', 'multi_agent_v1.wait_agent', 'web.run',
+})
+CODEX_CUSTOM_TOOLS = frozenset({'exec', 'apply_patch'})   # built-in freeform tools
 
 
 def fn_label(ns: str, name: str) -> str:
-    """'fn:<namespace>.<name>' for built-in function tools; every MCP tool collapses to 'fn:mcp'."""
+    """'fn:<namespace>.<name>' for a built-in function tool on CODEX_FUNCTIONS, 'fn:mcp' for every MCP
+    tool, 'fn:other' for anything else."""
     if 'mcp__' in name or 'mcp__' in ns or name.startswith('mcp'):
         return 'fn:mcp'
-    n = name[:40]
-    if not _FN_NAME.match(n) or (ns and not _NS_NAME.match(ns)):
-        return 'fn:other'
-    return ('fn:' + ns + '.' if ns else 'fn:') + n
+    key = (ns + '.' + name) if ns else name
+    return 'fn:' + key if key in CODEX_FUNCTIONS else 'fn:other'
 
 
 def custom_label(name: str) -> str:
-    n = (name or 'custom')[:40]
-    return n if _FN_NAME.match(n) else 'custom-other'
+    """A built-in freeform tool name, or 'custom-other'."""
+    return name if name in CODEX_CUSTOM_TOOLS else 'custom-other'
 
 
 TAG_RX = re.compile(r'\s*<([a-z_ -]{2,40})>')
@@ -367,7 +379,7 @@ def fold(ev: list) -> dict:
     recs: list[tuple] = []
     synthetic = 0
     turn = 0
-    polls = polls_no_input = polls_no_new_output = 0
+    polls: list[list] = []   # [emitting call index in `calls`, sent no input, returned no new output]
     for i, e in enumerate(ev):
         k = e[0]
         if k == 'ctx':
@@ -395,8 +407,8 @@ def fold(ev: list) -> dict:
                 elif shell:
                     rec['legacy'] = shell
                 if tool in POLL_TOOLS:
-                    polls += 1
-                    polls_no_input += 1 if no_input else 0
+                    rec['pidx'] = len(polls)
+                    polls.append([len(calls) - 1, bool(no_input), False])
                 open_calls[cid or ('anon%d' % i)] = rec
             continue
         if k == 'tc':
@@ -430,8 +442,9 @@ def fold(ev: list) -> dict:
             rec = open_calls.pop(cid, None)
             if rec is None:
                 rec = {'tool': 'unmatched', 'cmds': [], 'out_chars': 0}
-            elif rec['tool'] in POLL_TOOLS and no_new:
-                polls_no_new_output += 1
+            pi = rec.pop('pidx', None)
+            if pi is not None and no_new:
+                polls[pi][2] = True
             if 'legacy' in rec:
                 lg = rec.pop('legacy')
                 if not rec['cmds']:
@@ -482,9 +495,41 @@ def fold(ev: list) -> dict:
         q = queue[(r['u'][0], r['u'][1], r['u'][2])]
         if q:
             r['match'] = q.popleft()
-    return {'live': live, 'tools': tools, 'inj': inj_live, 'recs': recs, 'forked': forked,
-            'synthetic': synthetic, 'responses_without_usage': len(calls) - len(live),
-            'polls': polls, 'polls_no_input': polls_no_input, 'polls_no_new_output': polls_no_new_output}
+    # each poll keeps the live index of the response that emitted it (-1 when that response has no usage),
+    # so polls emitted by a response copied from another file are not counted twice
+    poll_calls = [(idx_map[e] if 0 <= e and idx_map[e + 1] > idx_map[e] else -1, ni, nn) for e, ni, nn in polls]
+    s = {'live': live, 'tools': tools, 'inj': inj_live, 'recs': recs, 'forked': forked,
+         'synthetic': synthetic, 'responses_without_usage': len(calls) - len(live), 'poll_calls': poll_calls}
+    count_polls(s)
+    return s
+
+
+def count_polls(s: dict) -> None:
+    """Poll counters over polls whose emitting response is billed in this file."""
+    live = s['live']
+    n = no_in = no_new = 0
+    for li, ni, nn in s['poll_calls']:
+        if li >= 0 and live[li].get('copied'):
+            continue
+        n += 1
+        no_in += ni
+        no_new += nn
+    s['polls'], s['polls_no_input'], s['polls_no_new_output'] = n, no_in, no_new
+
+
+def mark_copied(s: dict, copied_rids) -> None:
+    """Mark calls tied to response ids billed in another file as `copied` (kept in the timeline, not
+    billed, attributed or counted again), drop their unmatched records and recount the polls."""
+    if copied_rids:
+        for r in s['recs']:
+            if r['rid'] in copied_rids and r['match'] is not None:
+                s['live'][r['match']]['copied'] = True
+        s['recs'] = [r for r in s['recs'] if not (r['rid'] in copied_rids and r['match'] is None)]
+        count_polls(s)
+    for c in s['live']:
+        c['model'] = model_label(c['model']) if c['model'] is not None else None
+    for r in s['recs']:
+        r['model'] = model_label(r['model']) if r['model'] is not None else None
 
 
 def read_session(path: str, until: str | None = None, copied_rids: frozenset | None = None) -> dict:
@@ -493,14 +538,6 @@ def read_session(path: str, until: str | None = None, copied_rids: frozenset | N
     their unmatched records are dropped."""
     ev, meta = scan(path, until)
     s = fold(ev)
-    if copied_rids:
-        for r in s['recs']:
-            if r['rid'] in copied_rids and r['match'] is not None:
-                s['live'][r['match']]['copied'] = True
-        s['recs'] = [r for r in s['recs'] if not (r['rid'] in copied_rids and r['match'] is None)]
-    for c in s['live']:
-        c['model'] = model_label(c['model']) if c['model'] is not None else None
-    for r in s['recs']:
-        r['model'] = model_label(r['model']) if r['model'] is not None else None
+    mark_copied(s, copied_rids)
     s['meta'] = meta
     return s

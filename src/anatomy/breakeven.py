@@ -24,8 +24,11 @@ the same replay already evicted.
 
 Everything here is modeled: it is a counterfactual on observed usage, and
 re-fetch cost is an explicit assumption (zero by default, an upper bound). Each
-result also carries its break-even re-fetch rate: the share of evicted tokens
-that could come back, at worst-case timing, before the policy stops paying.
+result also carries its break-even re-fetch rate: the share of evicted outputs
+that could come back before the policy stops paying. A re-fetch is charged its
+lost read savings, a fresh write of its tokens and one extra model round trip
+(see record()); longer reasoning on the re-fetching turn is not modeled, so the
+rate is an estimate, not a bound.
 """
 from __future__ import annotations
 
@@ -36,6 +39,7 @@ from .attribute import cpt, tr_cat
 from .ingest.claude import ctx
 
 LOADED_SCHEMAS = 'tool_result:ToolSearch:loaded_tool_schemas'
+ROUNDTRIP_OUTPUT_TOKENS = 350   # assumed output of the extra call that asks for an evicted output again
 
 
 # ---------------------------------------------------------------- the rule
@@ -105,14 +109,16 @@ class Timeline:
     wt[j]      1 for a call billed in this file, 0 for one copied from another file
     read[j]    cache read price of call j, USD per token
     write[j]   price of rewriting a token on call j at its tier, USD per token
+    out[j]     output price of call j, USD per token
     items      (entry call, tokens, death call, evictable) in context order; an item is
                in context on calls entry .. death-1
     """
-    __slots__ = ('n', 'ctx', 'wt', 'read', 'write', 'items', 'cw', 'cr')
+    __slots__ = ('n', 'ctx', 'wt', 'read', 'write', 'out', 'items', 'cw', 'cr')
 
-    def __init__(self, ctx_list, wt, read, write, items):
+    def __init__(self, ctx_list, wt, read, write, items, out=None):
         self.n = len(ctx_list)
         self.ctx, self.wt, self.read, self.write, self.items = ctx_list, wt, read, write, items
+        self.out = out if out is not None else [0.0] * self.n
         cw, cr = [0.0], [0.0]
         for j in range(self.n):
             cw.append(cw[-1] + wt[j])
@@ -129,7 +135,7 @@ def claude_timeline(th: dict, prices) -> Timeline:
     tool_uses = th['tool_uses']
     n = len(calls)
     ttl1h = sum(c['cc1'] for c in calls) > sum(c['cc5'] for c in calls)
-    ctx_list, wt, read, write = [], [], [], []
+    ctx_list, wt, read, write, outp = [], [], [], [], []
     items: list = []
     alive: list = []
     prev_ctx = 0
@@ -141,10 +147,12 @@ def claude_timeline(th: dict, prices) -> Timeline:
         if r is None:
             read.append(0.0)
             write.append(0.0)
+            outp.append(0.0)
         else:
             one_h = c['cc1'] > c['cc5'] or (c['cc1'] == c['cc5'] == 0 and ttl1h)
             read.append(r.cache_read)
             write.append(r.cache_write_1h if one_h else r.cache_write_5m)
+            outp.append(r.output)
         pre = c['pre']
         marker = any(i['kind'] == 'compact_marker' for i in pre)
         new = []          # (tokens estimate, evictable)
@@ -190,7 +198,7 @@ def claude_timeline(th: dict, prices) -> Timeline:
         prev_ctx = cx
     for itm in alive:
         itm[2] = n
-    return Timeline(ctx_list, wt, read, write, [tuple(i) for i in items])
+    return Timeline(ctx_list, wt, read, write, [tuple(i) for i in items], outp)
 
 
 def codex_timeline(s: dict, prices) -> Timeline:
@@ -198,7 +206,7 @@ def codex_timeline(s: dict, prices) -> Timeline:
     A rewritten suffix bills as uncached input (rollouts report no cache writes)."""
     live = s['live']
     n = len(live)
-    ctx_list, wt, read, write = [], [], [], []
+    ctx_list, wt, read, write, outp = [], [], [], [], []
     win_start, win_end = {}, {}
     for i, c in enumerate(live):
         win_start.setdefault(c['window'], i)
@@ -209,6 +217,7 @@ def codex_timeline(s: dict, prices) -> Timeline:
         r = prices.rates(c['model'], inp)
         read.append(r.cached_input if r else 0.0)
         write.append(r.input if r else 0.0)
+        outp.append(r.output if r else 0.0)
     raw = []   # (entry, order, tokens, death, evictable)
     for w, st in win_start.items():
         raw.append((st, 0, float(live[st]['u'][0]), win_end[w], False))
@@ -224,7 +233,7 @@ def codex_timeline(s: dict, prices) -> Timeline:
         if pl < n and pl != win_start.get(live[pl]['window']):
             raw.append((pl, 3, r['out_chars'] / 4.0, win_end[live[pl]['window']], True))
     raw.sort(key=lambda x: (x[0], x[1]))
-    return Timeline(ctx_list, wt, read, write, [(e, t, d, ev) for e, _, t, d, ev in raw])
+    return Timeline(ctx_list, wt, read, write, [(e, t, d, ev) for e, _, t, d, ev in raw], outp)
 
 
 # ---------------------------------------------------------------- replay
@@ -316,10 +325,12 @@ class Clearing:
 
 def replay(tl: Timeline, policy) -> list:
     """Run a policy over one timeline. Returns one tuple per scored batch:
-    (b, S, L_calls, read_life, w, r) where read_life is the sum of read prices over the billed
-    calls the evicted tokens would have stayed for (token-weighted), and w, r are the write
-    and read prices of the next call, which rewrites the suffix. Batches whose rewrite lands
-    on a copied call are applied (so the timeline matches its original) but not scored."""
+    (b, S, L_calls, read_life, w, r, n_items, ctx_after, o) where read_life is the sum of read
+    prices over the billed calls the evicted tokens would have stayed for (token-weighted);
+    w, r and o are the write, read and output prices of the next call, which rewrites the
+    suffix; n_items is the number of outputs evicted and ctx_after the pruned context that
+    call reads. Batches whose rewrite lands on a copied call are applied (so the timeline
+    matches its original) but not scored."""
     items = tl.items
     m = len(items)
     fen = _Fenwick(m)
@@ -360,7 +371,7 @@ def replay(tl: Timeline, policy) -> list:
         if tl.wt[j + 1] and b > 0:
             L = sum(items[o][1] * (tl.cw[items[o][2]] - tl.cw[j + 1]) for o in chosen) / b
             RL = sum(items[o][1] * (tl.cr[items[o][2]] - tl.cr[j + 1]) for o in chosen) / b
-            out.append((b, S, L, RL, tl.write[j + 1], tl.read[j + 1]))
+            out.append((b, S, L, RL, tl.write[j + 1], tl.read[j + 1], len(chosen), ctx_cf - b, tl.out[j + 1]))
         for o in chosen:
             fen.add(o, -items[o][1])
             evicted[o] = True
@@ -373,21 +384,31 @@ def replay(tl: Timeline, policy) -> list:
 def record(agg, key: str, batches: list, ratios: tuple = (), refetch_rate: float = 0.0) -> None:
     """Add scored batches to agg['be:' + key] (plain counters, so they merge by addition).
 
-    At the user's prices each batch pays iff b x read_life > S x (w - r) + refetch. A
-    re-fetched token is taken to come back on the very next call: its read savings are
-    lost and it is written again, so refetch = refetch_rate x b x (read_life + w). That
-    timing is the worst case, so a net at a given rate is a floor for that rate. For each
-    reference ratio R the batch pays iff L x b / S > R (the launch analysis' test)."""
+    At the user's prices each batch pays iff b x read_life > S x (w - r) + refetch. The
+    re-fetch rate is the share of evicted outputs that are asked for again. Each re-fetch
+    is charged three things: its read savings (the output comes back on the very next call,
+    so every later read it saved is lost), a fresh write of its tokens, and one extra model
+    round trip to ask for it, which reads the pruned context at the read price and generates
+    ROUNDTRIP_OUTPUT_TOKENS of output:
+
+        refetch = refetch_rate x (b x (read_life + w) + n_items x (ctx_after x r + 350 x o))
+
+    Longer reasoning on the re-fetching turn is not modeled, so the net at a given rate is
+    an estimate, not a bound. For each reference ratio R the batch pays iff L x b / S > R
+    (the launch analysis' test, before re-fetches)."""
     a = agg['be:' + key]
-    for b, S, L, RL, w, r in batches:
-        refetch = refetch_rate * b * (RL + w)
+    for b, S, L, RL, w, r, n_items, ctx_after, o in batches:
+        unit = b * (RL + w) + n_items * (ctx_after * r + ROUNDTRIP_OUTPUT_TOKENS * o)
+        refetch = refetch_rate * unit
         mg = b * RL - S * (w - r) - refetch
         a['batches'] += 1
         a['tokens'] += b
         a['saved_read_usd'] += b * RL
         a['rewrite_usd'] += S * (w - r)
         a['refetch_usd'] += refetch
-        a['refetch_unit_usd'] += b * (RL + w)
+        a['refetch_unit_usd'] += unit
+        a['refetch_roundtrip_unit_usd'] += n_items * (ctx_after * r + ROUNDTRIP_OUTPUT_TOKENS * o)
+        a['items'] += n_items
         a['net_usd'] += mg
         if mg > 0:
             a['pay_batches'] += 1
@@ -402,9 +423,9 @@ def record(agg, key: str, batches: list, ratios: tuple = (), refetch_rate: float
 
 
 def breakeven_refetch_rate(a) -> float:
-    """The re-fetch rate at which the policy's net reaches zero, with every re-fetch on the next
-    call (its savings lost and a write paid): p x sum(b x (read_life + w)). 0 when the policy
-    loses even with no re-fetch."""
+    """The re-fetch rate at which the policy's net reaches zero, each re-fetch charged as in
+    record() (its savings lost, a write paid and one extra round trip). 0 when the policy loses
+    even with no re-fetch."""
     unit = a.get('refetch_unit_usd', 0.0)
     net0 = a.get('net_usd', 0.0) + a.get('refetch_usd', 0.0)
     if unit <= 0 or net0 <= 0:
@@ -416,12 +437,14 @@ def share_paying(agg, key: str, ratios: tuple = ()) -> dict:
     """Share of the user's own eviction opportunities that pay back at their prices."""
     a = agg.get('be:' + key) or {}
     nb, tk = a.get('batches', 0), a.get('tokens', 0.0)
-    out = {'batches': int(nb), 'tokens': round(tk),
+    out = {'batches': int(nb), 'outputs_evicted': int(a.get('items', 0)), 'tokens': round(tk),
            'share_batches_that_pay': round(a.get('pay_batches', 0) / nb, 4) if nb else None,
            'share_tokens_in_paying_batches': round(a.get('pay_tokens', 0.0) / tk, 4) if tk else None,
            'saved_read_usd': round(a.get('saved_read_usd', 0.0), 6),
            'rewrite_usd': round(a.get('rewrite_usd', 0.0), 6),
            'refetch_usd': round(a.get('refetch_usd', 0.0), 6),
+           'refetch_cost_if_all_come_back_usd': round(a.get('refetch_unit_usd', 0.0), 6),
+           'of_which_extra_round_trips_usd': round(a.get('refetch_roundtrip_unit_usd', 0.0), 6),
            'net_usd': round(a.get('net_usd', 0.0), 6),
            'net_usd_if_only_paying_batches': round(a.get('net_usd_paying_only', 0.0), 6),
            'breakeven_refetch_rate': breakeven_refetch_rate(a)}

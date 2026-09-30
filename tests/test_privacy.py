@@ -87,5 +87,68 @@ class Gate(unittest.TestCase):
         self.assertEqual(model_label(None), 'unknown')
 
 
+class PrivateToolNames(unittest.TestCase):
+    """Tool names are printed only from a fixed allowlist of built-in tools."""
+    PRIVATE = ('acme_payroll', 'sync_client_ledger', 'globex_dispatch', 'AcmePayrollSync')
+
+    def test_labels(self):
+        from anatomy.ingest.claude import tool_category
+        from anatomy.ingest.codex import custom_label, fn_label
+        self.assertEqual(fn_label('acme_payroll', 'sync_client_ledger'), 'fn:other')
+        self.assertEqual(fn_label('', 'sync_client_ledger'), 'fn:other')
+        self.assertEqual(fn_label('collaboration', 'sync_client_ledger'), 'fn:other')   # known namespace, unknown name
+        self.assertEqual(fn_label('acme_payroll', 'spawn_agent'), 'fn:other')          # known name, unknown namespace
+        self.assertEqual(fn_label('', 'write_stdin'), 'fn:write_stdin')
+        self.assertEqual(fn_label('collaboration', 'spawn_agent'), 'fn:collaboration.spawn_agent')
+        self.assertEqual(fn_label('', 'mcp__acme__read'), 'fn:mcp')
+        self.assertEqual(custom_label('globex_dispatch'), 'custom-other')
+        self.assertEqual(custom_label('exec'), 'exec')
+        self.assertEqual(tool_category('AcmePayrollSync'), 'other')
+        self.assertEqual(tool_category('Bash'), 'Bash')
+        self.assertEqual(tool_category('Task'), 'Agent')
+
+    def test_end_to_end(self):
+        import os
+        import tempfile
+        from tests.fixtures.make_fixtures import assistant, cx, tc, usage, user, write
+        from tests.helpers import ANTHROPIC_PRICES, OPENAI_PRICES
+        with tempfile.TemporaryDirectory() as d:
+            cdir, xdir = os.path.join(d, 'claude'), os.path.join(d, 'codex')
+            write(os.path.join(cdir, 'p', 's.jsonl'), [
+                user(0, 'go'),
+                assistant(1, 'msg_p1', 'claude-opus-5-5', usage(3, cc5=1000, out=10),
+                          [{'type': 'tool_use', 'id': 'toolu_p1', 'name': 'AcmePayrollSync', 'input': {}}]),
+                user(2, [{'type': 'tool_result', 'tool_use_id': 'toolu_p1', 'content': 'x' * 400}]),
+                assistant(3, 'msg_p2', 'claude-opus-5-5', usage(3, cc5=200, cr=1000, out=10), [{'type': 'text', 'text': 'ok'}])])
+            write(os.path.join(xdir, 'sessions', '2026', '09', '01', 'rollout-p.jsonl'), [
+                cx(0, 'session_meta', {'id': 's', 'source': 'cli'}),
+                cx(1, 'turn_context', {'model': 'gpt-5.6-sol'}),
+                cx(2, 'event_msg', {'type': 'task_started'}),
+                cx(3, 'response_item', {'type': 'message', 'role': 'user', 'content': [{'type': 'input_text', 'text': 'go'}]}),
+                cx(4, 'response_item', {'type': 'function_call', 'namespace': 'acme_payroll', 'name': 'sync_client_ledger',
+                                        'call_id': 'c1', 'arguments': '{}'}),
+                cx(4, 'response_item', {'type': 'custom_tool_call', 'name': 'globex_dispatch', 'call_id': 'c2', 'input': 'go'}),
+                tc(5, 1050, 1000, 0, 50, 0),
+                cx(6, 'response_item', {'type': 'function_call_output', 'call_id': 'c1', 'output': 'y' * 4000}),
+                cx(6, 'response_item', {'type': 'custom_tool_call_output', 'call_id': 'c2', 'output': 'z' * 4000}),
+                cx(7, 'response_item', {'type': 'reasoning', 'summary': []}),
+                tc(8, 3100, 3000, 1000, 50, 0)])
+            for extra in (('--json',), ()):
+                argv = ['audit', '--claude-dir', cdir, '--codex-dir', xdir, '--workers', '1',
+                        '--anthropic-prices', ANTHROPIC_PRICES, '--openai-prices', OPENAI_PRICES, *extra]
+                import contextlib
+                import io
+                out, err = io.StringIO(), io.StringIO()
+                with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                    code = cli.main(argv)
+                self.assertEqual(code, 0, err.getvalue())
+                for name in self.PRIVATE:
+                    self.assertNotIn(name, out.getvalue() + err.getvalue())
+                if extra:
+                    kinds = json.loads(out.getvalue())['codex']['context_rent']['tool_output_by_kind']
+                    self.assertIn('fn:other', kinds)
+                    self.assertIn('custom-other', kinds)
+
+
 if __name__ == '__main__':
     unittest.main()

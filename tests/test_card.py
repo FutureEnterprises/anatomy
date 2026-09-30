@@ -22,7 +22,7 @@ def synthetic_report(threads=40, sessions=8):
     fix = lambda i, n, **kw: {'basis': 'modeled', 'id': i, 'net_usd': n, 'clears_breakeven': True, 'upper_bound': False, **kw}
     return {
         'prices': {'anthropic': {'snapshot_date': '2026-09-30'}, 'openai': {'snapshot_date': '2026-09-30'}},
-        'claude': {'list_price_usd': {'total': 1000.0}},
+        'claude': {'list_price_usd': {'served': 900.0}, 'declined_fallbacks_usd': {'declined_billed': 100.0}},
         'codex': {'list_price_usd': {'total': 500.0}},
         'audits': {
             'unit': 'USD API list-price equivalent',
@@ -53,6 +53,11 @@ class Build(unittest.TestCase):
         text = card.render_text(self.c)
         self.assertIn('about 50 minutes', text)
         self.assertIn('even with no re-fetches', text)
+        self.assertIn('would have saved $40 in replay', text)   # a replay, never a realized saving
+        self.assertNotRegex(text, r'\bsaves\b|POPULAR|popular')
+        self.assertIn('Claude Code $900 served', text)
+        self.assertRegex(text, r'Plus \$100 of declined .*billing assumed.*\[estimated\]')
+        self.assertEqual(self.c['spend_declined']['basis'], 'estimated')
         self.assertNotIn('batches of 150K', text)          # upper-bound fixes are never ranked
 
     def test_no_label_is_missing(self):

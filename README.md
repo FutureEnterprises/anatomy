@@ -30,11 +30,11 @@ PYTHONPATH=src python3 -m anatomy scan
 |---|---|
 | `anatomy scan` | The ledger: calls, tokens and list-price cost by tier, model and thread kind; input cost attributed by cause; cache rebuilds by cause; Codex process polls. |
 | `anatomy audit` | The scan plus every audit (boot scope, keep-alive, polls, oversized outputs, context clearing, break-even), each with at most one fix and whether it clears break-even at your prices. |
-| `anatomy card` | A numbers-only card: your top three fixes that clear break-even and the one popular trick that would cost you money. `--svg FILE` also writes it as an image. Below 20 threads or 5 sessions the card is marked do-not-share. |
+| `anatomy card` | A numbers-only card: your top three fixes that clear break-even and the one evaluated trick that would have cost you money in replay. `--svg FILE` also writes it as an image. Below 20 threads or 5 sessions the card is marked do-not-share. |
 
 Common options: `--json`, `--until TIME` (ignore records after a UTC time, to pin a snapshot), `--no-claude`, `--no-codex`, `--claude-dir`, `--codex-dir`, `--workers`, and `--dedupe {global,file}` (default `global`: bill each message or response id once across all files; `file` reproduces per-file deduplication for comparison).
 
-Every number in the output ends with its basis: `[observed]` (transcript usage fields, times list price), `[estimated]` (attribution and token-size estimates), `[modeled]` (counterfactual replays) or `[invoiced]` (vendor data, which Anatomy only has if you supply it). See [docs/method.md](docs/method.md).
+Every number in the output ends with its basis: `[observed]` (transcript usage fields, times list price, and the published prices themselves), `[estimated]` (attribution, token-size estimates, and the cost of declined Claude Code fallback attempts, whose billing the pricing page does not state), `[modeled]` (counterfactual replays) or `[invoiced]` (vendor data, which Anatomy only has if you supply it). See [docs/method.md](docs/method.md).
 
 ## The break-even page
 
@@ -49,12 +49,13 @@ Regenerate `site/prices.json` after a price update with `python3 site/make_price
 ## Privacy
 
 - Runs entirely on your machine. Standard library only; no network calls.
-- Prints numbers and fixed labels only. A privacy gate refuses any output string outside a fixed vocabulary of labels and public model names, and scans the rendered text for secret, email, path and URL shapes before printing. Prompt text, file contents, paths, commands, project names and MCP server names never reach the output.
+- Prints numbers and labels only. Prompt text, file contents, paths and commands never become labels. A tool name is printed only when it is on a fixed list of built-in Claude Code and Codex tools; any other tool name prints as `other` and every MCP tool as `mcp`, so your own tool, plugin and MCP server names stay out. Model ids print only when they look like public model names. Other labels are harness-defined words (attachment and message kinds) that pass a shape filter and a deny list.
+- Before printing, a gate walks the whole result and refuses any string that fails that shape filter or deny list, then scans the rendered text for secret, email, path and URL shapes (the two vendor pricing pages are the only URLs allowed). The gate is a shape check, not a vocabulary check; the allowlists above are what keep private names out.
 - Reads transcripts read-only and writes nothing unless you ask for `--svg FILE`.
 
 ## Prices
 
-`src/anatomy/prices/anthropic.toml` and `openai.toml` are dated snapshots of the official pricing pages, each with its source URL. Every report prints the snapshot date next to its dollars, because prices change and the break-even moves with them.
+`src/anatomy/prices/anthropic.toml` and `openai.toml` are dated snapshots of the official pricing pages, each with its source URL. The scan and audit reports print each snapshot's date and source URL, and the card prints the dates, because prices change and the break-even moves with them.
 
 ## Credits
 

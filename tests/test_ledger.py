@@ -44,10 +44,14 @@ class ClaudeLedger(unittest.TestCase):
     def test_declined_fallback_attempts(self):
         billed = (5 * 20 + 23100 * 40 + 40 * 100) * M     # streamed 40 tokens before the decline
         maybe = (5 * 20 + 23300 * 40) * M                 # declined before any output
-        s = self.g['list_price_usd']
-        self.assertAlmostEqual(s['declined_billed'], billed, places=6)
-        self.assertAlmostEqual(s['declined_maybe_billed'], maybe, places=6)
-        self.assertAlmostEqual(s['total'], s['served'] + billed, places=4)
+        s, d = self.g['list_price_usd'], self.g['declined_fallbacks_usd']
+        self.assertAlmostEqual(d['declined_billed'], billed, places=6)
+        self.assertAlmostEqual(d['declined_maybe_billed'], maybe, places=6)
+        self.assertAlmostEqual(d['total'], s['served'] + billed, places=4)
+        # billing of declined attempts is not stated on the pricing page: estimated, never observed
+        self.assertEqual(s['basis'], 'observed')
+        self.assertNotIn('declined_billed', s)
+        self.assertEqual((d['basis'], d['billing_assumed']), ('estimated', True))
         fb = self.g['fallback']
         self.assertEqual((fb['calls_with_fallback'], fb['declined_attempts_billed'], fb['declined_attempts_pre_output']), (2, 1, 1))
         self.assertEqual(fb['declined_by_model'], {'claude-fable-5': 2})

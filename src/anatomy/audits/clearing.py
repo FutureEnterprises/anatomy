@@ -8,9 +8,16 @@ on later calls against the rewrite of the suffix after the earliest cleared
 output. Re-fetch cost is taken as zero, so every net here is an upper bound: a
 variant that loses money at zero re-fetch loses more once re-fetches count.
 Each variant also reports its break-even re-fetch rate: the share of cleared
-tokens that could be fetched back, each on the very next call (its savings lost
-and a write paid), before the variant stops paying. The fix picks the variant with the highest break-even rate, the
-one most tolerant of re-fetches, and stays marked as an upper bound.
+outputs that could be fetched back before the variant stops paying, each re-fetch
+charged its lost savings, a fresh write and one extra round trip
+(breakeven.record). The best variant is the one most tolerant of re-fetches.
+
+Nothing in a transcript says which cleared outputs would have been needed again.
+The one measurement behind this project is a lexical proxy on the launch corpus:
+60% of evicted Claude Code outputs were mentioned again later (it overstates
+re-fetches). A variant is proposed as a fix only when its break-even rate clears
+that reference by REFERENCE_MARGIN; otherwise it is reported as at break-even at
+best and not recommended.
 """
 from __future__ import annotations
 
@@ -19,7 +26,9 @@ from .. import breakeven as be
 TRIGGER = 100_000
 KEEP = 3
 BATCHES = (20_000, 60_000, 150_000)
-POPULAR = 20_000   # the small-batch setting evaluated as the popular trick
+SMALL_BATCH = 20_000   # the small-batch setting evaluated as the trick
+REFETCH_REFERENCE = 0.60   # lexical re-fetch proxy measured on the launch corpus (Claude Code)
+REFERENCE_MARGIN = 0.15
 
 
 def key(vendor: str, B: int) -> str:
@@ -35,7 +44,7 @@ def report(agg, ratios: tuple) -> dict:
     out = {'policy': {'basis': 'modeled', 'trigger_tokens': TRIGGER, 'keep_recent_outputs': KEEP,
                       'refetch_rate': 0.0, 'upper_bound': True}}
     best = None
-    popular = 0.0
+    small = 0.0
     evaluated = False
     for B in BATCHES:
         tot, unit, net0 = 0.0, 0.0, 0.0
@@ -53,13 +62,17 @@ def report(agg, ratios: tuple) -> dict:
         pstar = round(net0 / unit, 4) if unit > 0 and net0 > 0 else 0.0
         if tot > 0 and (best is None or pstar > best[2]):
             best = (B, tot, pstar)
-        if B == POPULAR:
-            popular = tot
+        if B == SMALL_BATCH:
+            small = tot
     out['fix'] = None
-    if best:
+    if best and best[2] >= REFETCH_REFERENCE + REFERENCE_MARGIN:
         out['fix'] = {'basis': 'modeled', 'id': 'batched_clearing', 'net_usd': round(best[1], 6),
                       'batch_tokens': best[0], 'breakeven_refetch_rate': best[2],
                       'clears_breakeven': True, 'upper_bound': True}
-    out['trick'] = {'basis': 'modeled', 'id': 'clear_tool_outputs_small_batches', 'net_usd': round(popular, 6),
-                    'batch_tokens': POPULAR, 'evaluated': evaluated, 'zero_refetch': True}
+    elif best:
+        out['not_recommended'] = {'basis': 'modeled', 'id': 'batched_clearing', 'batch_tokens': best[0],
+                                  'net_usd_before_refetch': round(best[1], 6), 'breakeven_refetch_rate': best[2],
+                                  'reference_refetch_rate': REFETCH_REFERENCE}
+    out['trick'] = {'basis': 'modeled', 'id': 'clear_tool_outputs_small_batches', 'net_usd': round(small, 6),
+                    'batch_tokens': SMALL_BATCH, 'evaluated': evaluated, 'zero_refetch': True}
     return out

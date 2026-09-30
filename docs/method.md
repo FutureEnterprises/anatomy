@@ -6,8 +6,8 @@ How Anatomy turns local transcripts into a cost ledger, and how it decides wheth
 
 | Basis | Meaning |
 |---|---|
-| observed | Read from transcript usage fields (tokens, calls), or those fields times a published list price. |
-| estimated | Attribution of observed tokens to a cause (a tool result, a boot prefix, an idle gap), and token sizes estimated from characters. |
+| observed | Read from transcript usage fields (tokens, calls), or those fields times a published list price, and the published prices and write/read ratios themselves. |
+| estimated | Attribution of observed tokens to a cause (a tool result, a boot prefix, an idle gap), token sizes estimated from characters, and the cost of declined Claude Code fallback attempts (billing assumed). |
 | modeled | A counterfactual replay: what a change would have saved on the recorded calls. Not a live result. |
 | invoiced | Vendor invoice or usage-report data. Anatomy has none unless you supply it, and says so. |
 
@@ -15,7 +15,7 @@ Subscription plans do not bill per token. On a subscription, read the dollars as
 
 ## The ledger
 
-**Claude Code** (`~/.claude/projects/**/*.jsonl`). One line per message id, carrying the served attempt's top-level usage: uncached input, 5-minute and 1-hour cache writes, cache reads and output, each at its own price. A declined fallback attempt that had already streamed output is billed from its per-attempt usage record; one declined before any output is reported separately and kept out of the total.
+**Claude Code** (`~/.claude/projects/**/*.jsonl`). One line per message id, carrying the served attempt's top-level usage: uncached input, 5-minute and 1-hour cache writes, cache reads and output, each at its own price. A declined fallback attempt that had already streamed output is priced from its per-attempt usage record and added to the total, but reported separately and labeled estimated: its usage is recorded, while the pricing page does not say whether declined attempts are billed. One declined before any output is reported separately and kept out of the total.
 
 **Codex** (`~/.codex/sessions` and `~/.codex/archived_sessions`). One line per deduplicated `token_count` event, at long-context rates when the request is over the model's threshold, plus compaction requests that appear only as usage records.
 
@@ -29,7 +29,7 @@ Deleting b tokens from a cached prompt saves their cache read r on each of the L
 
     a deletion pays only if  b × L × r  >  S × (w - r)  (+ any re-fetch cost)
 
-Divide by b × r: the deletion pays back after (S / b) × R calls, where R = (w - r) / r is the model's write/read ratio. With the tail as large as the deletion (S = b), the rule is L > R. Examples from the price snapshots in this repository (modeled, from list prices dated 2026-09-30):
+Divide by b × r: the deletion pays back after (S / b) × R calls, where R = (w - r) / r is the model's write/read ratio. With the tail as large as the deletion (S = b), the rule is L > R. Examples from the price snapshots in this repository (published list prices dated 2026-09-30; Anatomy labels these ratios observed):
 
 | Model | R, 5-minute cache | R, 1-hour cache |
 |---|---:|---:|
@@ -44,7 +44,7 @@ Codex rollouts report no cache-write tokens, so a rewritten Codex suffix is pric
 Three details matter when the rule is applied to real transcripts:
 
 1. **S is measured on the pruned context.** The tail to rewrite is everything still in context after the earliest removed token, net of anything an earlier edit in the same replay already removed. Measuring it on the historical context counts earlier removals twice and overstates the rewrite.
-2. **Re-fetch is an assumption.** Nothing in a transcript says whether a removed output would have been needed again. Anatomy reports the zero re-fetch case as an upper bound and the re-fetch rate at which the edit stops paying.
+2. **Re-fetch is an assumption.** Nothing in a transcript says whether a removed output would have been needed again. Anatomy reports the zero re-fetch case as an upper bound and the re-fetch rate at which the edit stops paying. Each re-fetch is charged the read savings it gives back, a fresh write of its tokens and one extra model call to ask for it (reading the pruned context, plus a few hundred output tokens). Longer reasoning on that call is not modeled, so the break-even rate is an estimate, not a bound. Batched clearing is proposed as a fix only when its break-even rate is at least 15 points above the 60% re-fetch rate a lexical proxy measured on the launch corpus; otherwise the audit says it is not recommended.
 3. **Prices are per call.** Each call is priced at its own model and cache tier, so the same edit can pay on one model and lose on another.
 
 The same ratio decides keep-alive in the other direction: a ping re-reads the prefix at r, a rebuild writes it at w, so pinging pays while the gap needs fewer than R pings.

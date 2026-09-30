@@ -4,7 +4,7 @@
   audit   the scan plus the audits: break-even, boot scope, keep-alive, polls, oversized
           outputs and batched clearing, each with at most one fix
   card    a numbers-only card: top three fixes that clear break-even at your prices and
-          the one popular trick that would cost you money (text, JSON or SVG)
+          the one evaluated trick that would have cost you money (text, JSON or SVG)
 
 Nothing is sent anywhere. Output passes the privacy gate (privacy.py) before it
 is printed or written: numbers and fixed labels only.
@@ -24,7 +24,7 @@ from . import card as card_mod
 from .ingest import claude as claude_ingest
 from .ingest import codex as codex_ingest
 from .prices import AnthropicPrices, OpenAIPrices
-from .privacy import PrivacyError, assert_clean, gate, model_label
+from .privacy import PrivacyError, assert_clean, gate
 
 # ---------------------------------------------------------------- workers
 _STATE: dict = {}
@@ -69,15 +69,7 @@ def read_codex(path, until=None, copied=None):
     Kept equal to read_session() by a test."""
     ev, meta = codex_ingest.scan(path, until)
     s = codex_ingest.fold(ev)
-    if copied:
-        for r in s['recs']:
-            if r['rid'] in copied and r['match'] is not None:
-                s['live'][r['match']]['copied'] = True
-        s['recs'] = [r for r in s['recs'] if not (r['rid'] in copied and r['match'] is None)]
-    for c in s['live']:
-        c['model'] = model_label(c['model']) if c['model'] is not None else None
-    for r in s['recs']:
-        r['model'] = model_label(r['model']) if r['model'] is not None else None
+    codex_ingest.mark_copied(s, copied)
     s['meta'] = meta
     return s, ev
 
@@ -212,9 +204,12 @@ def claude_report(a) -> dict:
             'calls_by_kind': dict(a['claude_calls_by_kind'].most_common()),
         },
         'tokens_by_tier': {'basis': 'observed', **{k: a['claude_tok_tier'][k] for k in ledger.TIERS}},
-        'list_price_usd': {'basis': 'observed', 'unit': LIST_PRICE,
-                           'served': _r(served), 'declined_billed': _r(billed), 'total': _r(served + billed),
-                           'declined_maybe_billed': _r(usd['declined_maybe_billed']), 'served_input': _r(served_input)},
+        'list_price_usd': {'basis': 'observed', 'unit': LIST_PRICE, 'served': _r(served), 'served_input': _r(served_input)},
+        # Declined fallback attempts: their usage is observed, but whether they are billed is not stated on the
+        # pricing page, so the dollars (and every total that includes them) are estimated, billing assumed.
+        'declined_fallbacks_usd': {'basis': 'estimated', 'unit': LIST_PRICE, 'billing_assumed': True,
+                                   'declined_billed': _r(billed), 'total': _r(served + billed),
+                                   'declined_maybe_billed': _r(usd['declined_maybe_billed'])},
         'list_price_usd_by_tier': {'basis': 'observed', 'unit': LIST_PRICE, **{k: _r(a['claude_usd_tier'][k]) for k in ledger.TIERS}},
         'list_price_usd_by_model': {'basis': 'observed', 'unit': LIST_PRICE, **dict(sorted(by_model.items(), key=lambda kv: -kv[1]))},
         'list_price_usd_by_kind': {'basis': 'observed', 'unit': LIST_PRICE, **by_kind},
@@ -300,25 +295,30 @@ def _n(x):
     return format(x, ',')
 
 
+def _prices_line(p: dict) -> str:
+    return '# Prices: Anthropic snapshot %s (%s), OpenAI snapshot %s (%s).' % (
+        p['anthropic']['snapshot_date'], p['anthropic']['source_url'], p['openai']['snapshot_date'], p['openai']['source_url'])
+
+
 def render_text(rep: dict) -> str:
     """Lines starting with '#' are metadata. Every other line with a number ends with its basis."""
     L = []
     p = rep['prices']
     L.append('# Anatomy %s scan. Dollars are %s at the price snapshots below.' % (rep['anatomy_version'], LIST_PRICE))
-    L.append('# Prices: Anthropic snapshot %s, OpenAI snapshot %s.' % (p['anthropic']['snapshot_date'], p['openai']['snapshot_date']))
+    L.append(_prices_line(p))
     if rep.get('until'):
         L.append('# Records after %s UTC are ignored.' % rep['until'])
     L.append('# Bases: [observed] transcript usage fields, [estimated] attribution, [modeled] counterfactual, [invoiced] vendor data.')
     L.append('invoiced totals: not available (no vendor invoice or usage report supplied)  [invoiced]')
     c = rep.get('claude')
     if c:
-        co, s = c['corpus'], c['list_price_usd']
+        co, s, d = c['corpus'], c['list_price_usd'], c['declined_fallbacks_usd']
         L.append('')
         L.append('CLAUDE CODE  %s files, %s threads with calls, %s calls  [observed]' % (_n(co['files']), _n(co['threads_with_calls']), _n(co['calls'])))
         L.append('  served attempts          %14s  [observed]' % _money(s['served']))
-        L.append('  declined fallbacks       %14s  output streamed before the decline  [observed]' % _money(s['declined_billed']))
-        L.append('  total                    %14s  [observed]' % _money(s['total']))
-        L.append('  declined before output   %14s  may be billed, not in total  [observed]' % _money(s['declined_maybe_billed']))
+        L.append('  declined fallbacks       %14s  output streamed before the decline, billing assumed  [estimated]' % _money(d['declined_billed']))
+        L.append('  total                    %14s  served plus declined fallbacks  [estimated]' % _money(d['total']))
+        L.append('  declined before output   %14s  may be billed, not in total  [estimated]' % _money(d['declined_maybe_billed']))
         L.append(_dedupe_line(c['dedupe']))
         L.append('  by tier   ' + '  '.join('%s %s' % (k, _money(v)) for k, v in c['list_price_usd_by_tier'].items() if k not in ('basis', 'unit')) + '  [observed]')
         L.append('  by kind   ' + '  '.join('%s %s' % (k, _money(v)) for k, v in c['list_price_usd_by_kind'].items() if k not in ('basis', 'unit')) + '  [observed]')
@@ -408,7 +408,7 @@ def render_audit_text(rep: dict) -> str:
     au = rep['audits']
     p = rep['prices']
     L = ['# Anatomy %s audit. Dollars are %s at the price snapshots below.' % (rep['anatomy_version'], LIST_PRICE),
-         '# Prices: Anthropic snapshot %s, OpenAI snapshot %s.' % (p['anthropic']['snapshot_date'], p['openai']['snapshot_date']),
+         _prices_line(p),
          '# Rule: evicting b tokens pays only if b x L x r > S x (w - r) + expected re-fetch cost.',
          '# Bases: [observed] transcript usage and published prices, [estimated] attribution and sizes, '
          '[modeled] counterfactual savings, [invoiced] vendor data.']
@@ -418,18 +418,22 @@ def render_audit_text(rep: dict) -> str:
         L.append('')
         L.append(title)
         for name, d in sec.items():
-            if name in ('fix', 'trick') or not isinstance(d, dict):
+            if name in ('fix', 'trick', 'not_recommended') or not isinstance(d, dict):
                 continue
             L += _section_lines(name, d, d.get('basis', 'modeled'))
+        nr = sec.get('not_recommended')
         f = sec.get('fix')
         if f:
             L.append('  fix: %s  [modeled]' % audits.fix_text(f))
             L.append('    net %s at your prices%s  [modeled]' % (_money(f['net_usd']), ', an upper bound' if f['upper_bound'] else ''))
+        elif nr:
+            L.append('  fix: none recommended. %s  [modeled]' % audits.not_recommended_text(nr))
+            L.append('    net %s at your prices before re-fetches, an upper bound  [modeled]' % _money(nr['net_usd_before_refetch']))
         else:
             L.append('  fix: none clears break-even at your prices')
         t = sec.get('trick')
         if t and t['evaluated']:
-            L.append('  popular trick: %s, net %s at your prices%s  [modeled]' % (
+            L.append('  trick evaluated: %s, net %s at your prices%s  [modeled]' % (
                 audits.trick_text(t), _money(t['net_usd']),
                 ', before re-fetches (an upper bound)' if t.get('zero_refetch') else ''))
     return '\n'.join(L) + '\n'
@@ -508,7 +512,7 @@ def main(argv=None) -> int:
     a = sub.add_parser('audit', help='the scan plus every audit, each with at most one fix')
     _corpus_args(a)
     a.add_argument('--json', action='store_true', help='print JSON instead of text')
-    c = sub.add_parser('card', help='numbers-only card: top three fixes and the one trick that would cost you money')
+    c = sub.add_parser('card', help='numbers-only card: top three fixes and the one trick that would have cost you money')
     _corpus_args(c)
     c.add_argument('--json', action='store_true', help='print the card as JSON instead of text')
     c.add_argument('--svg', metavar='FILE', help='also write the card as an SVG image to FILE')

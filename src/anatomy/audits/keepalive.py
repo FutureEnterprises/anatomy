@@ -14,8 +14,8 @@ Three views, all modeled:
   stop (the break-even cap). Gaps that outlast the cap pay the pings and the
   rebuild. Main threads also pay the full cap after their last call, since the
   pinger cannot know the session is over;
-- always on: ping through every gap, however long (the popular setting; no
-  pings after the last call are charged, which flatters it).
+- always on: ping through every gap, however long, with no cap (no pings
+  after the last call are charged, which flatters it).
 
 The thread's TTL class follows attribute.py: 1 hour when the thread writes more
 1-hour than 5-minute cache tokens.

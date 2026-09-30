@@ -40,16 +40,20 @@ class Replay(unittest.TestCase):
         self.assertEqual(tl.ctx[4], 53_000)
         got = be.replay(tl, be.Lease())
         self.assertEqual(len(got), 2)
-        (b1, S1, L1, RL1, w1, r1), (b2, S2, L2, RL2, w2, r2) = got
+        (b1, S1, L1, RL1, w1, r1, n1, ctx1, o1), (b2, S2, L2, RL2, w2, r2, n2, ctx2, o2) = got
         self.assertAlmostEqual(b1, 40_000, delta=1)
         self.assertAlmostEqual(S1, 3_000, delta=1)       # 53K - 10K boot - 40K evicted
         self.assertEqual(L1, 5)                          # calls 5..9
         self.assertAlmostEqual(RL1, 5 * 1.0 * M)
         self.assertAlmostEqual(w1, 12.5 * M)
         self.assertAlmostEqual(r1, 1.0 * M)
+        self.assertEqual(n1, 1)
+        self.assertAlmostEqual(ctx1, 13_000, delta=1)    # the pruned context a re-fetching call reads
+        self.assertAlmostEqual(o1, 50.0 * M)
         # the second suffix excludes the first batch, already gone in the counterfactual (43K without the fix)
         self.assertAlmostEqual(S2, 3_000, delta=1)
         self.assertEqual(L2, 1)
+        self.assertAlmostEqual(ctx2, 16_000, delta=1)    # 96K less both batches
 
     def test_copied_calls_are_replayed_but_not_scored(self):
         tl = be.claude_timeline(two_batch_thread(copied_upto=5), AP)
@@ -103,16 +107,21 @@ class Share(unittest.TestCase):
         m1 = 40_000 * 5 * M - 3_000 * 11.5 * M
         m2 = 40_000 * 1 * M - 3_000 * 11.5 * M
         self.assertAlmostEqual(sh['net_usd'], m1 + m2, places=4)
-        # every re-fetch on the next call: the savings are lost and the tokens are written again
-        unit = 40_000 * (5 * M + 12.5 * M) + 40_000 * (1 * M + 12.5 * M)
+        # every re-fetch on the next call: the savings are lost, the tokens are written again, and one
+        # extra round trip reads the pruned context and writes 350 tokens of output
+        trip = (13_000 * 1 * M + 350 * 50 * M) + (16_000 * 1 * M + 350 * 50 * M)
+        unit = 40_000 * (5 * M + 12.5 * M) + 40_000 * (1 * M + 12.5 * M) + trip
         self.assertAlmostEqual(sh['breakeven_refetch_rate'], round((m1 + m2) / unit, 4), places=4)
+        self.assertAlmostEqual(sh['of_which_extra_round_trips_usd'], trip, places=6)
+        self.assertEqual(sh['outputs_evicted'], 2)
 
     def test_refetch_cost_lowers_the_net(self):
         agg = new_agg()
         batches = be.replay(be.claude_timeline(two_batch_thread(), AP), be.Lease())
         be.record(agg, 'k', batches, (), refetch_rate=0.5)
         sh = be.share_paying(agg, 'k')
-        self.assertAlmostEqual(sh['refetch_usd'], 0.5 * (40_000 * 17.5 * M + 40_000 * 13.5 * M), places=4)
+        trip = (13_000 * 1 * M + 350 * 50 * M) + (16_000 * 1 * M + 350 * 50 * M)
+        self.assertAlmostEqual(sh['refetch_usd'], 0.5 * (40_000 * 17.5 * M + 40_000 * 13.5 * M + trip), places=6)
         self.assertEqual(sh['share_batches_that_pay'], 0.0)
 
     def test_empty(self):

@@ -2,14 +2,20 @@
 
 Two layers:
 
-1. Labels are sanitized where they are created (ingest). A label is either a
-   fixed-vocabulary word, a public model id, or the bucket 'other'. Message
-   text, file contents, paths, commands, ids and MCP server names never become
-   labels.
+1. Labels are sanitized where they are created (ingest). Tool names are
+   printed only when they are on a fixed allowlist of built-in Claude Code and
+   Codex tools (ingest/claude.BUILTIN_TOOLS, ingest/codex.CODEX_FUNCTIONS);
+   every other tool name becomes 'other', and every MCP tool 'mcp'. Model ids
+   must look like public model names. Harness-defined words such as attachment
+   types pass a shape filter (`label()`) plus the deny list below; command
+   kinds and message kinds come from fixed lists. Message text, file contents,
+   paths, commands, ids and MCP server names never become labels.
 2. Before anything is printed, `gate()` walks the whole result and refuses
-   (raises PrivacyError) if any key or string is not a safe label, and
-   `assert_clean()` scans the rendered text for secret, email, path and URL
-   shapes. The error names the rule, never the offending value.
+   (raises PrivacyError) if any key or string fails the shape filter or the
+   deny list, and `assert_clean()` scans the rendered text for secret, email,
+   path and URL shapes. The gate is a shape filter, not a vocabulary check: it
+   is the second layer, and the allowlists in layer 1 are what keep private
+   names out. The error names the rule, never the offending value.
 """
 from __future__ import annotations
 

@@ -40,6 +40,9 @@ class Labels(unittest.TestCase):
         for ln in lines:
             self.assertRegex(ln, TAG, ln)
         self.assertIn('invoiced totals: not available', out)
+        self.assertIn('https://platform.claude.com/docs/en/about-claude/pricing', out)   # snapshot source, not only its date
+        self.assertIn('https://developers.openai.com/api/docs/pricing', out)
+        self.assertRegex(out, r'declined fallbacks .*billing assumed  \[estimated\]')
 
     def test_dollars_are_list_price_equivalent(self):
         for extra in ((), ('--json',)):
