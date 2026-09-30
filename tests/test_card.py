@@ -101,6 +101,43 @@ class Build(unittest.TestCase):
         self.assertIn('None of the evaluated tricks loses money', text)
 
 
+class SharesOnly(unittest.TestCase):
+    def setUp(self):
+        self.c = card.build(synthetic_report(), shares_only=True)
+
+    def test_no_dollar_amount_anywhere(self):
+        self.assertFalse([k for k, _ in _keys(self.c) if 'usd' in k])
+        self.assertEqual([f['id'] for f in self.c['fixes']], ['boot_listings_on_demand', 'keepalive_capped', 'codex_blocking_waits'])
+        text, svg = card.render_text(self.c), card.render_svg(self.c)
+        for out in (text, svg, json.dumps(self.c)):
+            self.assertNotIn('$', out)
+        self.assertIn('Dollar amounts hidden', text)
+        self.assertIn('Claude Code 60.0% served, Codex 33.3%', text)
+        self.assertRegex(text, r'Plus 6\.7% of declined .*billing assumed.*\[estimated\]')
+        self.assertIn('would have saved 2.7% of spend read in replay', text)
+        self.assertIn('would have cost 0.8% of spend read in replay, even with no re-fetches', text)
+        ET.fromstring(svg)
+
+    def test_every_number_labeled(self):
+        gate(self.c)
+        for path, basis in numeric_leaves(self.c):
+            self.assertIn(basis, BASES, path)
+        for kind, text in card.lines(self.c):
+            if kind in ('title', 'meta') or not re.search(r'\d', text):
+                continue
+            self.assertRegex(text.rstrip(), TAG, text)
+
+
+def _keys(obj, pre=''):
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            yield pre + k, v
+            yield from _keys(v, pre + k + '.')
+    elif isinstance(obj, list):
+        for v in obj:
+            yield from _keys(v, pre)
+
+
 class CardCommand(unittest.TestCase):
     def test_card_on_fixtures(self):
         with tempfile.TemporaryDirectory() as d:
@@ -121,6 +158,21 @@ class CardCommand(unittest.TestCase):
         ET.fromstring(svg)
         for s in PRIVATE:
             self.assertNotIn(s, out + err + svg + js + err2)
+
+    def test_shares_only_on_fixtures(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, 'card.svg')
+            code, out, err = run('card', '--shares-only', '--svg', path)
+            self.assertEqual(code, 0, err)
+            with open(path, encoding='utf-8') as fh:
+                svg = fh.read()
+        code2, js, err2 = run('card', '--shares-only', '--json')
+        self.assertEqual(code2, 0, err2)
+        c = json.loads(js)
+        self.assertTrue(c['shares_only'])
+        self.assertNotIn('$', out + svg + js)
+        self.assertNotIn('_usd', js)
+        ET.fromstring(svg)
 
 
 if __name__ == '__main__':

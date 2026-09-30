@@ -1,0 +1,6 @@
+title: Anatomy
+description: A local, cache-correct cost audit for Claude Code and Codex transcripts.
+theme: jekyll-theme-primer
+markdown: kramdown
+kramdown:
+  input: GFM

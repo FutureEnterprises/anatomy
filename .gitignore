@@ -7,3 +7,5 @@ dist/
 # never commit real transcripts or scan output
 *.anatomy.json
 scan-*.json
+docs/_site/
+.jekyll-cache/

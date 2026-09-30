@@ -2,6 +2,8 @@
 
 A local, cache-correct cost audit for Claude Code and Codex transcripts.
 
+**Read the essay:** [The anatomy of 745,771 agent calls](https://futureenterprises.github.io/anatomy/essay.html). **Try the numbers:** the [break-even calculator](https://futureenterprises.github.io/anatomy/calculator/). The pre-registered [benchmark design](https://futureenterprises.github.io/anatomy/benchmark.html) is published; nothing has run yet.
+
 Both tools already keep a transcript of every session on your machine. Anatomy reads them, rebuilds what each API call would cost at list prices (cache writes and cache reads priced separately, each response billed once), attributes the cost to what caused it, and prices candidate fixes against your own model's cache prices. Removing context from a cached prompt forces everything after it to be cached again, so a trick that saves money on one model can lose it on another. Anatomy does that arithmetic per call.
 
 ## What it is not
@@ -15,7 +17,7 @@ Both tools already keep a transcript of every session on your machine. Anatomy r
 Python 3.12 or later. No dependencies.
 
 ```
-uvx --from git+https://github.com/<OWNER>/anatomy anatomy scan
+uvx --from git+https://github.com/FutureEnterprises/anatomy anatomy scan
 ```
 
 From a clone:
@@ -30,21 +32,21 @@ PYTHONPATH=src python3 -m anatomy scan
 |---|---|
 | `anatomy scan` | The ledger: calls, tokens and list-price cost by tier, model and thread kind; input cost attributed by cause; cache rebuilds by cause; Codex process polls. |
 | `anatomy audit` | The scan plus every audit (boot scope, keep-alive, polls, oversized outputs, context clearing, break-even), each with at most one fix and whether it clears break-even at your prices. |
-| `anatomy card` | A numbers-only card: your top three fixes that clear break-even and the one evaluated trick that would have cost you money in replay. `--svg FILE` also writes it as an image. Below 20 threads or 5 sessions the card is marked do-not-share. |
+| `anatomy card` | A numbers-only card: your top three fixes that clear break-even and the one evaluated trick that would have cost you money in replay. `--svg FILE` also writes it as an image, and `--shares-only` replaces every dollar amount with a share of the spend read. Below 20 threads or 5 sessions the card is marked do-not-share. |
 
 Common options: `--json`, `--until TIME` (ignore records after a UTC time, to pin a snapshot), `--no-claude`, `--no-codex`, `--claude-dir`, `--codex-dir`, `--workers`, and `--dedupe {global,file}` (default `global`: bill each message or response id once across all files; `file` reproduces per-file deduplication for comparison).
 
 Every number in the output ends with its basis: `[observed]` (transcript usage fields, times list price, and the published prices themselves), `[estimated]` (attribution, token-size estimates, and the cost of declined Claude Code fallback attempts, whose billing the pricing page does not state), `[modeled]` (counterfactual replays) or `[invoiced]` (vendor data, which Anatomy only has if you supply it). See [docs/method.md](docs/method.md).
 
-## The break-even page
+## The break-even calculator
 
-[site/breakeven.html](site/breakeven.html) is a static page: pick a model and cache tier, or enter b, L, S, w and r, and it shows whether a deletion pays, the write/read ratio and the calls needed to pay back. It uses one local script and the price snapshot in `site/prices.json`, and sends nothing anywhere. Serve the folder to use the model picker:
+[The calculator](https://futureenterprises.github.io/anatomy/calculator/) ([source](docs/calculator/index.html)) is a static page: pick a model and cache tier, or enter b, L, S, w and r, and it shows whether a deletion pays, the write/read ratio and the calls needed to pay back. It uses one local script and the price snapshot in `docs/calculator/prices.json`, and sends nothing anywhere. To run it locally, serve the folder:
 
 ```
-python3 -m http.server --directory site 8000
+python3 -m http.server --directory docs/calculator 8000
 ```
 
-Regenerate `site/prices.json` after a price update with `python3 site/make_prices.py`.
+Regenerate `docs/calculator/prices.json` after a price update with `python3 scripts/make_prices.py`. A test fails if the page data and the snapshots disagree.
 
 ## Privacy
 
@@ -72,4 +74,4 @@ This stands on other people's work:
 
 ## License
 
-Apache-2.0. See [LICENSE](LICENSE).
+Apache-2.0. See [LICENSE](https://github.com/FutureEnterprises/anatomy/blob/main/LICENSE).

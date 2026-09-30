@@ -516,6 +516,8 @@ def main(argv=None) -> int:
     _corpus_args(c)
     c.add_argument('--json', action='store_true', help='print the card as JSON instead of text')
     c.add_argument('--svg', metavar='FILE', help='also write the card as an SVG image to FILE')
+    c.add_argument('--shares-only', action='store_true',
+                   help='hide every dollar amount: print spend and fixes as shares of the spend read')
     args = ap.parse_args(argv)
     args.audit = args.cmd in ('audit', 'card')
     rep = scan(args)
@@ -523,7 +525,7 @@ def main(argv=None) -> int:
     try:
         gate(rep)
         if args.cmd == 'card':
-            cd = card_mod.build(rep)
+            cd = card_mod.build(rep, shares_only=args.shares_only)
             out = json.dumps(cd, indent=1) + '\n' if args.json else card_mod.render_text(cd)
             if args.svg:
                 svg = card_mod.render_svg(cd)

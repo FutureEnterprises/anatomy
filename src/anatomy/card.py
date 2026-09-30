@@ -4,7 +4,9 @@ Built from a scan report that carries audits. The card holds numbers, fixed
 labels and the price snapshot dates; the sentences come from a fixed vocabulary
 in audits/__init__.py. Both renderings (text and SVG) pass the privacy gate
 before they are returned, and the card says when the sample is below the
-minimum group size for sharing (20 threads and 5 sessions).
+minimum group size for sharing (20 threads and 5 sessions). With shares_only
+the card holds no dollar amounts at all: spend and every fix are shares of the
+spend read, for posting a card without disclosing what you spend.
 """
 from __future__ import annotations
 
@@ -15,7 +17,11 @@ SVG_NS = 'http://www.w3.org/2000/svg'   # the only URL in the SVG; a constant, n
 TEXT_PARAMS = ('cap_minutes_5m', 'cap_tokens', 'batch_tokens', 'vendors', 'breakeven_refetch_rate')   # numbers a fix sentence quotes
 
 
-def build(rep: dict) -> dict:
+def _share(x, total):
+    return round(x / total, 4) if total else None
+
+
+def build(rep: dict, shares_only: bool = False) -> dict:
     au = rep['audits']
     c = rep.get('claude') or {}
     served = c.get('list_price_usd', {}).get('served', 0.0)
@@ -27,13 +33,13 @@ def build(rep: dict) -> dict:
         if round(f['net_usd'], 2) <= 0:
             continue    # below a cent at display precision
         fixes.append({'basis': 'modeled', 'id': f['id'], 'audit': f['audit'], 'net_usd': round(f['net_usd'], 2),
-                      'share_of_spend': round(f['net_usd'] / spend, 4) if spend else None,
+                      'share_of_spend': _share(f['net_usd'], spend),
                       **{k: f[k] for k in TEXT_PARAMS if k in f}})
     t = A.costly_trick(au)
     trick = None
     if t:
         trick = {'basis': 'modeled', 'id': t['id'], 'net_usd': round(t['net_usd'], 2),
-                 'share_of_spend': round(t['net_usd'] / spend, 4) if spend else None,
+                 'share_of_spend': _share(t['net_usd'], spend),
                  'zero_refetch': bool(t.get('zero_refetch'))}
     ev = {'basis': 'modeled', 'refetch_rate': 0.0}
     for v in ('claude', 'codex'):
@@ -53,6 +59,15 @@ def build(rep: dict) -> dict:
         'eviction_payback': ev,
         'sample': dict(au['sample']),
     }
+    if shares_only:
+        card['shares_only'] = True
+        card['spend'] = {'basis': 'observed', 'claude_served_share': _share(served, spend), 'codex_share': _share(codex, spend)}
+        card['spend_declined'] = {'basis': 'estimated', 'claude_declined_fallbacks_share': _share(declined, spend),
+                                  'billing_assumed': True}
+        for f in fixes:
+            del f['net_usd']
+        if trick:
+            del trick['net_usd']
     gate(card)
     return card
 
@@ -67,28 +82,45 @@ def _pct(x):
 
 def lines(card: dict) -> list:
     """(kind, text) rows shared by the text and SVG renderings. kind: title, meta, head, row, note."""
-    R = [('title', 'ANATOMY CARD'),
-         ('meta', 'Dollars are %s, not an invoice. Prices: Anthropic %s, OpenAI %s.' % (
-             card['unit'], card['prices']['anthropic_snapshot'], card['prices']['openai_snapshot'])),
-         ('row', 'Spend read: Claude Code %s served, Codex %s  [observed]' % (
-             _money(card['spend']['claude_served_usd']), _money(card['spend']['codex_usd'])))]
-    dc = card['spend_declined']['claude_declined_fallbacks_usd']
-    if dc:
-        R.append(('note', 'Plus %s of declined Claude Code fallback attempts, billing assumed, included in spend read  [estimated]'
-                  % _money(dc)))
+    so = card.get('shares_only', False)
+    prices = 'Prices: Anthropic %s, OpenAI %s.' % (card['prices']['anthropic_snapshot'], card['prices']['openai_snapshot'])
+    if so:
+        sp, dc = card['spend'], card['spend_declined']['claude_declined_fallbacks_share']
+        R = [('title', 'ANATOMY CARD'),
+             ('meta', 'Shares of spend read, priced at %s, not an invoice. Dollar amounts hidden. %s' % (card['unit'], prices)),
+             ('row', 'Spend read: Claude Code %s served, Codex %s  [observed]' % (
+                 _pct(sp['claude_served_share']), _pct(sp['codex_share'])))]
+        if dc:
+            R.append(('note', 'Plus %s of declined Claude Code fallback attempts, billing assumed, included in spend read  [estimated]'
+                      % _pct(dc)))
+    else:
+        dc = card['spend_declined']['claude_declined_fallbacks_usd']
+        R = [('title', 'ANATOMY CARD'),
+             ('meta', 'Dollars are %s, not an invoice. %s' % (card['unit'], prices)),
+             ('row', 'Spend read: Claude Code %s served, Codex %s  [observed]' % (
+                 _money(card['spend']['claude_served_usd']), _money(card['spend']['codex_usd'])))]
+        if dc:
+            R.append(('note', 'Plus %s of declined Claude Code fallback attempts, billing assumed, included in spend read  [estimated]'
+                      % _money(dc)))
     R.append(('head', 'TOP FIXES THAT CLEAR BREAK-EVEN AT YOUR PRICES'))
     if not card['fixes']:
         R.append(('row', 'None of the audited fixes clears break-even at your prices.'))
     for i, f in enumerate(card['fixes'], 1):
         R.append(('row', '%d. %s  [modeled]' % (i, A.fix_text(f))))
-        R.append(('note', '   would have saved %s in replay, %s of spend read  [modeled]' % (_money(f['net_usd']), _pct(f['share_of_spend']))))
+        if so:
+            R.append(('note', '   would have saved %s of spend read in replay  [modeled]' % _pct(f['share_of_spend'])))
+        else:
+            R.append(('note', '   would have saved %s in replay, %s of spend read  [modeled]' % (_money(f['net_usd']), _pct(f['share_of_spend']))))
     R.append(('head', 'THE EVALUATED TRICK THAT WOULD HAVE COST YOU MONEY'))
     t = card['costly_trick']
     if t:
         R.append(('row', A.trick_text(t) + '  [modeled]'))
-        R.append(('note', '   would have cost %s in replay, %s of spend read%s  [modeled]' % (
-            _money(-t['net_usd']), _pct(-t['share_of_spend']) if t['share_of_spend'] is not None else 'n/a',
-            ', even with no re-fetches' if t['zero_refetch'] else '')))
+        share = _pct(-t['share_of_spend']) if t['share_of_spend'] is not None else 'n/a'
+        tail = ', even with no re-fetches' if t['zero_refetch'] else ''
+        if so:
+            R.append(('note', '   would have cost %s of spend read in replay%s  [modeled]' % (share, tail)))
+        else:
+            R.append(('note', '   would have cost %s in replay, %s of spend read%s  [modeled]' % (_money(-t['net_usd']), share, tail)))
     else:
         R.append(('row', 'None of the evaluated tricks loses money at your prices.'))
     ev = card['eviction_payback']

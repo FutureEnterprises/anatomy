@@ -92,12 +92,13 @@ th { font-size: 12px; letter-spacing: .08em; text-transform: uppercase; }
 td.num, th.num { text-align: right; }
 footer { border-top: 3px solid var(--ink); padding: 20px 0 40px; font-size: 13px; color: var(--muted); }
 footer a, .lede a { color: var(--ink); }
+.kicker a { color: inherit; text-decoration: none; }
 </style>
 </head>
 <body>
 <header>
   <div class="wrap">
-    <p class="kicker">Anatomy / break-even</p>
+    <p class="kicker"><a href="../">Anatomy</a> / break-even</p>
     <h1>Does deleting context pay?</h1>
     <p class="rule-line">b &times; L &times; r &gt; S &times; (w - r)</p>
     <p class="lede">Deleting b tokens from a cached prompt saves their cache read (r) on each of the L calls they would have stayed. It also forces the S tokens after them to be written to the cache again (w instead of r), once. The deletion pays only when the first side is larger.</p>
@@ -178,7 +179,7 @@ footer a, .lede a { color: var(--ink); }
 <footer>
   <div class="wrap">
     <p id="sources">Price snapshots load from prices.json.</p>
-    <p>Part of Anatomy, a local cost audit for Claude Code and Codex transcripts. This page runs entirely in your browser and sends nothing anywhere.</p>
+    <p>Part of <a href="../">Anatomy</a>, a local cost audit for Claude Code and Codex transcripts. Read <a href="../essay.html">the essay</a>, or get <a href="https://github.com/FutureEnterprises/anatomy">the code</a>. This page runs entirely in your browser and sends nothing anywhere.</p>
   </div>
 </footer>
 <script src="breakeven.js"></script>

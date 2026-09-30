@@ -1,5 +1,5 @@
 // Break-even page for context deletions under prompt caching. No dependencies, no network
-// beyond reading prices.json from the same folder.
+// beyond reading prices.json from the same folder, so it works from any path it is served under.
 (function () {
   'use strict';
 

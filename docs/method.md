@@ -1,3 +1,8 @@
+---
+title: Method
+description: How Anatomy builds its cost ledger, labels every number and decides whether a context edit pays.
+---
+
 # Method
 
 How Anatomy turns local transcripts into a cost ledger, and how it decides whether a context edit pays. Every number Anatomy prints carries one of four bases, and every dollar is a USD API list-price equivalent at a dated price snapshot.
@@ -51,7 +56,7 @@ The same ratio decides keep-alive in the other direction: a ping re-reads the pr
 
 ## Prices
 
-`src/anatomy/prices/anthropic.toml` and `openai.toml` are dated snapshots of the official pricing pages, each with its source URL. Nothing else in the code holds a price. To update, re-open the pages, edit the snapshot and its `snapshot_date`, and regenerate the page data with `python3 site/make_prices.py`.
+`src/anatomy/prices/anthropic.toml` and `openai.toml` are dated snapshots of the official pricing pages, each with its source URL. Nothing else in the code holds a price. To update, re-open the pages, edit the snapshot and its `snapshot_date`, and regenerate the calculator's data with `python3 scripts/make_prices.py`.
 
 ## What this is not
 
