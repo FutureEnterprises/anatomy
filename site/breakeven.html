@@ -1,0 +1,186 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; connect-src 'self'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'">
+<meta name="referrer" content="no-referrer">
+<title>Context Break-Even</title>
+<meta name="description" content="Does deleting context from a cached prompt pay? Pick a model and cache tier, or enter your own prices, and see the break-even.">
+<style>
+:root {
+  --bg: #f4f2ee;
+  --surface: #ffffff;
+  --ink: #111111;
+  --muted: #5a5750;
+  --rule: #d9d5cc;
+  --accent: #d6361f;
+  --accent-ink: #ffffff;
+  --field: #ffffff;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #0f0f0f;
+    --surface: #1a1a1a;
+    --ink: #f3f1ec;
+    --muted: #a7a298;
+    --rule: #34322e;
+    --accent: #ff5a3c;
+    --accent-ink: #0f0f0f;
+    --field: #111111;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #0f0f0f;
+  --surface: #1a1a1a;
+  --ink: #f3f1ec;
+  --muted: #a7a298;
+  --rule: #34322e;
+  --accent: #ff5a3c;
+  --accent-ink: #0f0f0f;
+  --field: #111111;
+}
+* { box-sizing: border-box; }
+html { -webkit-text-size-adjust: 100%; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font: 16px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+}
+.wrap { max-width: 1080px; margin: 0 auto; padding: 0 16px; }
+header { border-bottom: 3px solid var(--ink); padding: 40px 0 28px; }
+.kicker { font-size: 13px; font-weight: 800; letter-spacing: .14em; text-transform: uppercase; color: var(--accent); margin: 0 0 12px; }
+h1 { font-size: clamp(34px, 7vw, 68px); line-height: .98; letter-spacing: -.02em; font-weight: 900; text-transform: uppercase; margin: 0 0 18px; }
+.rule-line { font: 700 clamp(18px, 3.2vw, 26px)/1.3 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; margin: 0 0 10px; overflow-wrap: anywhere; }
+.lede { color: var(--muted); max-width: 62ch; margin: 0; }
+main { padding: 28px 0 56px; }
+.grid { display: grid; grid-template-columns: 1fr; gap: 24px; }
+@media (min-width: 860px) { .grid { grid-template-columns: 1.05fr .95fr; gap: 32px; } }
+section.panel { background: var(--surface); border: 1px solid var(--rule); padding: 22px; }
+h2 { font-size: 13px; font-weight: 800; letter-spacing: .14em; text-transform: uppercase; margin: 0 0 16px; }
+.seg { display: flex; border: 2px solid var(--ink); margin-bottom: 18px; }
+.seg button { flex: 1; font: inherit; font-weight: 800; font-size: 13px; letter-spacing: .08em; text-transform: uppercase; padding: 10px 8px; border: 0; background: transparent; color: var(--ink); cursor: pointer; }
+.seg button[aria-pressed="true"] { background: var(--ink); color: var(--bg); }
+.fields { display: grid; grid-template-columns: 1fr 1fr; gap: 14px 16px; }
+.fields .wide { grid-column: 1 / -1; }
+.grid > *, .fields > * { min-width: 0; }
+label { display: block; font-size: 13px; font-weight: 700; margin-bottom: 6px; }
+label small { display: block; font-weight: 400; color: var(--muted); font-size: 12px; }
+input, select { width: 100%; font: inherit; font-size: 17px; padding: 10px 12px; border: 2px solid var(--ink); border-radius: 0; background: var(--field); color: var(--ink); min-width: 0; }
+input:focus-visible, select:focus-visible, button:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
+.check { display: flex; gap: 10px; align-items: center; font-size: 14px; }
+.check input { width: 20px; height: 20px; }
+.hidden { display: none !important; }
+.verdict { padding: 22px; border: 3px solid var(--ink); margin-bottom: 18px; }
+.verdict.pays { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); }
+.verdict .big { font-size: clamp(32px, 6vw, 52px); font-weight: 900; line-height: 1; letter-spacing: -.01em; text-transform: uppercase; margin: 0 0 10px; }
+.verdict p { margin: 0; }
+.stats { display: grid; grid-template-columns: 1fr 1fr; gap: 0; border-top: 1px solid var(--rule); }
+.stat { padding: 12px 0; border-bottom: 1px solid var(--rule); }
+.stat:nth-child(odd) { padding-right: 12px; }
+.stat .v { font-size: 22px; font-weight: 800; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.stat .k { font-size: 12px; color: var(--muted); }
+.basis { font-size: 11px; font-weight: 800; letter-spacing: .1em; text-transform: uppercase; color: var(--muted); }
+.note { font-size: 13px; color: var(--muted); margin: 14px 0 0; }
+.notice { border-left: 4px solid var(--accent); padding: 8px 12px; margin: 0 0 16px; font-size: 14px; }
+.span-all { grid-column: 1 / -1; }
+.table-scroll { overflow-x: auto; }
+table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; font-size: 14px; }
+th, td { text-align: left; padding: 8px 10px 8px 0; border-bottom: 1px solid var(--rule); white-space: nowrap; }
+th { font-size: 12px; letter-spacing: .08em; text-transform: uppercase; }
+td.num, th.num { text-align: right; }
+footer { border-top: 3px solid var(--ink); padding: 20px 0 40px; font-size: 13px; color: var(--muted); }
+footer a, .lede a { color: var(--ink); }
+</style>
+</head>
+<body>
+<header>
+  <div class="wrap">
+    <p class="kicker">Anatomy / break-even</p>
+    <h1>Does deleting context pay?</h1>
+    <p class="rule-line">b &times; L &times; r &gt; S &times; (w - r)</p>
+    <p class="lede">Deleting b tokens from a cached prompt saves their cache read (r) on each of the L calls they would have stayed. It also forces the S tokens after them to be written to the cache again (w instead of r), once. The deletion pays only when the first side is larger.</p>
+  </div>
+</header>
+<main>
+  <div class="wrap grid">
+    <section class="panel" aria-labelledby="in-h">
+      <h2 id="in-h">Inputs</h2>
+      <p class="notice hidden" id="load-note" role="status"></p>
+      <div class="seg" role="group" aria-label="Price source">
+        <button type="button" id="mode-model" aria-pressed="true">Pick a model</button>
+        <button type="button" id="mode-custom" aria-pressed="false">Enter prices</button>
+      </div>
+      <div class="fields">
+        <div class="wide" id="model-wrap">
+          <label for="model">Model</label>
+          <select id="model"></select>
+        </div>
+        <div class="wide" id="tier-wrap">
+          <label for="tier">Cache tier <small id="tier-help">Where the rewritten tail is written.</small></label>
+          <select id="tier"></select>
+        </div>
+        <div class="wide hidden" id="long-wrap">
+          <label class="check"><input type="checkbox" id="longctx"> Request over the long-context threshold (long-context rates)</label>
+        </div>
+        <div>
+          <label for="w">w: cache write <small>USD per million tokens</small></label>
+          <input id="w" type="number" inputmode="decimal" min="0" step="any">
+        </div>
+        <div>
+          <label for="r">r: cache read <small>USD per million tokens</small></label>
+          <input id="r" type="number" inputmode="decimal" min="0" step="any">
+        </div>
+        <div>
+          <label for="b">b: tokens deleted</label>
+          <input id="b" type="number" inputmode="numeric" min="0" step="1" value="30000">
+        </div>
+        <div>
+          <label for="S">S: tokens after the deletion</label>
+          <input id="S" type="number" inputmode="numeric" min="0" step="1" value="30000">
+        </div>
+        <div class="wide">
+          <label for="L">L: later calls the deleted tokens would have stayed in context</label>
+          <input id="L" type="number" inputmode="numeric" min="0" step="1" value="20">
+        </div>
+      </div>
+      <p class="note">Prices come from the dated snapshots in this repository. Editing w or r switches to your own prices.</p>
+    </section>
+
+    <section class="panel" aria-labelledby="out-h">
+      <h2 id="out-h">Result <span class="basis">modeled</span></h2>
+      <div class="verdict" id="verdict" aria-live="polite">
+        <p class="big" id="verdict-big">&nbsp;</p>
+        <p id="verdict-text">&nbsp;</p>
+      </div>
+      <div class="stats">
+        <div class="stat"><div class="v" id="o-ratio">-</div><div class="k">R = (w - r) / r <span class="basis">modeled</span></div></div>
+        <div class="stat"><div class="v" id="o-need">-</div><div class="k">calls needed to pay back = (S / b) &times; R <span class="basis">modeled</span></div></div>
+        <div class="stat"><div class="v" id="o-save">-</div><div class="k">saved reads, b &times; L &times; r <span class="basis">modeled</span></div></div>
+        <div class="stat"><div class="v" id="o-cost">-</div><div class="k">one rewrite, S &times; (w - r) <span class="basis">modeled</span></div></div>
+      </div>
+      <p class="note">Dollars are USD API list-price equivalent for one deletion: not live savings and not an invoice. Re-fetching deleted content later only makes a deletion harder to pay back; this page assumes none.</p>
+    </section>
+
+    <section class="panel span-all" aria-labelledby="ref-h">
+      <h2 id="ref-h">Calls to pay back when the tail is as large as the deletion (S = b) <span class="basis">modeled, from list prices</span></h2>
+      <div class="table-scroll">
+        <table>
+          <thead id="ref-head"></thead>
+          <tbody id="ref-body"></tbody>
+        </table>
+      </div>
+      <p class="note">With S = b the rule reduces to L &gt; R. A small deletion early in a long prompt needs more calls; a large, late one needs fewer.</p>
+    </section>
+  </div>
+</main>
+<footer>
+  <div class="wrap">
+    <p id="sources">Price snapshots load from prices.json.</p>
+    <p>Part of Anatomy, a local cost audit for Claude Code and Codex transcripts. This page runs entirely in your browser and sends nothing anywhere.</p>
+  </div>
+</footer>
+<script src="breakeven.js"></script>
+</body>
+</html>
