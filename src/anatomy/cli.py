@@ -5,9 +5,13 @@
           outputs and batched clearing, each with at most one fix
   card    a numbers-only card: top three fixes that clear break-even at your prices and
           the one evaluated trick that would have cost you money (text, JSON or SVG)
+  coach-baseline
+          a personal correction-streak baseline for the EMILIA Session Coach (coach.py)
 
-Nothing is sent anywhere. Output passes the privacy gate (privacy.py) before it
-is printed or written: numbers and fixed labels only.
+Nothing is sent anywhere, except that `coach-baseline --classify-with-claude`, given
+its consent flag, sends prompts to the user's own Claude account through the local
+claude CLI. Output passes the privacy gate (privacy.py) before it is printed or
+written: numbers and fixed labels only.
 """
 from __future__ import annotations
 
@@ -19,7 +23,7 @@ import time
 from datetime import datetime, timezone
 from multiprocessing import Pool
 
-from . import __version__, attribute, audits, breakeven, ledger
+from . import __version__, attribute, audits, breakeven, coach, ledger
 from . import card as card_mod
 from .ingest import claude as claude_ingest
 from .ingest import codex as codex_ingest
@@ -518,7 +522,36 @@ def main(argv=None) -> int:
     c.add_argument('--svg', metavar='FILE', help='also write the card as an SVG image to FILE')
     c.add_argument('--shares-only', action='store_true',
                    help='hide every dollar amount: print spend and fixes as shares of the spend read')
+    b = sub.add_parser('coach-baseline', help='personal correction-streak baseline for the EMILIA Session Coach',
+                       description='Count how often a Claude Code prompt is a correction after one correction, after two '
+                                   'in a row, and otherwise, and export the counts as the coach import '
+                                   '(%s). Labels are estimates; counts of prompts and sessions are observed.' % coach.FORMAT)
+    b.add_argument('--coach-session', metavar='ID', help='the coach session id shown in the panel')
+    b.add_argument('--coach-provider', choices=coach.COACH_PROVIDERS, help='the coach client this import is for')
+    b.add_argument('--claude-dir', help='Claude Code projects directory (default ~/.claude/projects)')
+    b.add_argument('--until', help='ignore records stamped after this ISO time (UTC if no offset)')
+    src = b.add_mutually_exclusive_group()
+    src.add_argument('--labels', metavar='FILE', help='JSONL of {"key": ..., "label": ...} for the keys --print-keys lists')
+    src.add_argument('--classify-with-claude', action='store_true',
+                     help='label prompts with your own Claude account through the local claude CLI (model haiku); '
+                          'needs --i-consent-to-send-prompts-to-my-claude')
+    b.add_argument('--i-consent-to-send-prompts-to-my-claude', action='store_true',
+                   help='allow --classify-with-claude to send prompt text and the reply before each to your Claude account')
+    b.add_argument('--classifier-id', metavar='ID', help='name of the labeler behind --labels (default labels-file)')
+    b.add_argument('--save-labels', metavar='FILE', help='with --classify-with-claude, also write the labels as JSONL for --labels')
+    b.add_argument('--print-keys', action='store_true',
+                   help='print each prompt\'s join key, session ordinal and index (never text), to label elsewhere')
+    b.add_argument('--out', metavar='FILE', help='write the coach import (or, with --print-keys, the keys) to FILE')
+    b.add_argument('--json', action='store_true', help='print the coach import instead of the summary')
+    b.add_argument('--workers', type=int, default=0, help='worker processes for reading (default: CPU count - 1)')
     args = ap.parse_args(argv)
+    if args.cmd == 'coach-baseline':
+        try:
+            until_epoch, until_iso = _parse_until(args.until)
+        except ValueError:
+            sys.stderr.write('anatomy: --until must be an ISO time\n')
+            return 2
+        return coach.main(args, until_epoch, until_iso)
     args.audit = args.cmd in ('audit', 'card')
     rep = scan(args)
     svg = None
