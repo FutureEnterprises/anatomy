@@ -93,8 +93,15 @@ class Base(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.root = os.path.join(self.tmp.name, 'projects')
         self.t = T(self.root)
+        self.environment = mock.patch.dict(os.environ, {'HOME': self.tmp.name, 'PATH': os.defpath}, clear=True)
+        self.environment.start()
+        self.real_policy_paths = coach._managed_policy_paths
+        self.policies = mock.patch.object(coach, '_managed_policy_paths', return_value=[])
+        self.policies.start()
 
     def tearDown(self):
+        self.policies.stop()
+        self.environment.stop()
         self.tmp.cleanup()
 
     def labels_file(self, mapping):
@@ -457,7 +464,10 @@ HELP = '''Usage: claude [options]
   --tools <tools...>
   --safe-mode
   --strict-mcp-config
+  --mcp-config <config>
   --disable-slash-commands
+  --setting-sources <sources>
+  --settings <settings>
   --system-prompt <prompt>
 '''
 
@@ -473,16 +483,22 @@ def reply(labels, model='claude-haiku-4-5-20251001', **env):
 class FakeClaude:
     """A stand-in for the claude CLI: answers --help, then labels every item with `label` (or per call)."""
 
-    def __init__(self, label='new', help_text=HELP, calls=None, missing=False):
+    def __init__(self, label='new', help_text=HELP, calls=None, missing=False, auth=None, auth_rc=0, help_rc=0):
         self.label, self.help_text, self.missing = label, help_text, missing
         self.calls = [] if calls is None else calls
+        self.auth = auth if auth is not None else {'loggedIn': True, 'authMethod': 'claude.ai',
+                                                 'apiProvider': 'firstParty', 'subscriptionType': 'pro'}
+        self.auth_rc = auth_rc
+        self.help_rc = help_rc
 
     def __call__(self, argv, stdin_text, cwd=None):
         self.calls.append((list(argv), stdin_text))
         if self.missing:
             raise FileNotFoundError('claude')
         if argv[1:] == ['--help']:
-            return 0, self.help_text
+            return self.help_rc, self.help_text
+        if argv[-3:] == ['auth', 'status', '--json']:
+            return self.auth_rc, json.dumps(self.auth)
         items = json.loads(stdin_text.split('Items:\n', 1)[1])
         lab = self.label(items) if callable(self.label) else [self.label] * len(items)
         if isinstance(lab, tuple):
@@ -522,11 +538,15 @@ class Classifier(Base):
     def test_argv_uses_listed_flags_and_disables_tools_and_persistence(self):
         fake = FakeClaude()
         labels, st = coach.classify(items(2), runner=fake, consent=True)
-        argv, stdin = fake.calls[1]
+        argv, stdin = next(call for call in fake.calls if 'Items:\n' in call[1])
         self.assertEqual(argv[:9], ['claude', '-p', '--model', 'haiku', '--output-format', 'json',
                                     '--no-session-persistence', '--tools', ''])
-        for f in ('--safe-mode', '--strict-mcp-config', '--disable-slash-commands', '--system-prompt'):
+        for f in ('--safe-mode', '--strict-mcp-config', '--disable-slash-commands', '--system-prompt', '--setting-sources', '--settings'):
             self.assertIn(f, argv)
+        self.assertEqual(json.loads(argv[argv.index('--mcp-config') + 1]), {'mcpServers': {}})
+        self.assertEqual(argv[argv.index('--setting-sources') + 1], '')
+        self.assertEqual(json.loads(argv[argv.index('--settings') + 1]), {'disableAllHooks': True, 'autoMemoryEnabled': False})
+        self.assertNotIn('--bare', argv)
         self.assertNotIn('prompt 0', ' '.join(argv))   # prompts go on stdin, never on the command line
         self.assertIn('prompt 0', stdin)
         self.assertEqual(len(labels), 2)
@@ -538,13 +558,14 @@ class Classifier(Base):
             coach.classify(items(1), runner=fake, consent=True)
         self.assertEqual(len(fake.calls), 1)
 
-    def test_optional_flags_are_left_out_when_not_listed(self):
-        fake = FakeClaude(help_text=HELP.replace('--safe-mode', '').replace('--system-prompt', ''))
-        coach.classify(items(1), runner=fake, consent=True)
-        argv, stdin = fake.calls[1]
-        self.assertNotIn('--safe-mode', argv)
-        self.assertNotIn('--system-prompt', argv)
-        self.assertTrue(stdin.startswith(coach.INSTRUCTION))
+    def test_each_missing_isolation_flag_refuses_without_unsafe_fallback_or_prompt_dispatch(self):
+        for flag in coach._REQUIRED_CLAUDE_FLAGS:
+            with self.subTest(flag=flag):
+                fake = FakeClaude(help_text=HELP.replace(flag, 'unsupported'))
+                with self.assertRaises(coach.ClassifierUnavailable):
+                    coach.classify(items(1), runner=fake, consent=True)
+                self.assertEqual(len(fake.calls), 1)
+                self.assertEqual(fake.calls[0][1], '')
 
     def test_missing_cli_is_a_refusal(self):
         with self.assertRaises(coach.ClassifierUnavailable):
@@ -596,7 +617,151 @@ class Classifier(Base):
         self.assertEqual(b['afterTwo'], {'corrections': 0, 'observed': 1})
         self.assertEqual(b['afterOne'], {'corrections': 1, 'observed': 2})
         self.assertEqual(b['otherwise'], {'corrections': 1, 'observed': 1})
-        self.assertIn('sending 4 prompts', err)
+        self.assertIn('classification of 4 prompt excerpts', err)
+
+    def test_provider_authentication_and_runtime_env_overrides_refuse_before_any_process(self):
+        for name in ('ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_BASE_URL', 'ANTHROPIC_CUSTOM_HEADERS',
+                     'ANTHROPIC_MODEL', 'CLAUDE_CODE_USE_BEDROCK', 'CLAUDE_CODE_USE_VERTEX', 'CLAUDE_CODE_USE_FOUNDRY',
+                     'CLAUDE_CODE_OAUTH_TOKEN', 'CLAUDE_CONFIG_DIR', 'CLAUDECODE', 'NODE_OPTIONS',
+                     'NODE_EXTRA_CA_CERTS', 'HTTPS_PROXY', 'SSLKEYLOGFILE'):
+            with self.subTest(name=name), mock.patch.dict(os.environ, {name: SECRET}):
+                fake = FakeClaude()
+                with self.assertRaises(coach.ClassifierUnavailable) as error:
+                    coach.classify(items(1), runner=fake, consent=True)
+                self.assertEqual(fake.calls, [])
+                self.assertNotIn(SECRET, str(error.exception))
+                self.assertNotIn(name, str(error.exception))
+
+    def test_empty_override_does_not_switch_accounts_and_is_not_forwarded(self):
+        with mock.patch.dict(os.environ, {'ANTHROPIC_API_KEY': '', 'ANTHROPIC_BASE_URL': ''}):
+            safe = coach.classifier_environment()
+            self.assertNotIn('ANTHROPIC_API_KEY', safe)
+            self.assertNotIn('ANTHROPIC_BASE_URL', safe)
+            labels, _ = coach.classify(items(1), runner=FakeClaude(), consent=True)
+        self.assertEqual(len(labels), 1)
+
+    def test_unrelated_node_repl_metadata_is_not_forwarded_or_a_provider_override(self):
+        with mock.patch.dict(os.environ, {'NODE_REPL_TRUSTED_BROWSER_CLIENT_SHA256S': SECRET}):
+            safe = coach.classifier_environment()
+            self.assertNotIn('NODE_REPL_TRUSTED_BROWSER_CLIENT_SHA256S', safe)
+            labels, _ = coach.classify(items(1), runner=FakeClaude(), consent=True)
+        self.assertEqual(len(labels), 1)
+
+    def test_default_runner_passes_only_guarded_environment_without_unrelated_credentials(self):
+        completed = type('Result', (), {'returncode': 0, 'stdout': 'safe-output'})()
+        with mock.patch.dict(os.environ, {'GH_TOKEN': SECRET, 'OPENAI_API_KEY': SECRET, 'AWS_SECRET_ACCESS_KEY': SECRET,
+                                         'EDITOR': SECRET_PATH}), mock.patch.object(subprocess, 'run', return_value=completed) as process:
+            self.assertEqual(coach.run_process(['claude', '--help'], '', self.tmp.name), (0, 'safe-output'))
+        options = process.call_args.kwargs
+        safe = options['env']
+        self.assertEqual(safe['HOME'], self.tmp.name)
+        self.assertEqual(safe['PATH'], os.defpath)
+        self.assertEqual(safe['CLAUDE_CODE_DISABLE_ATTACHMENTS'], '1')
+        self.assertEqual(safe['CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC'], '1')
+        self.assertNotIn(SECRET, safe.values())
+        self.assertNotIn(SECRET_PATH, safe.values())
+        self.assertTrue(options['capture_output'])
+        self.assertEqual(options['timeout'], coach.TIMEOUT_S)
+        self.assertEqual(options['cwd'], self.tmp.name)
+
+    def test_provider_settings_and_api_helpers_refuse_before_any_process(self):
+        directory = os.path.join(self.tmp.name, '.claude')
+        os.makedirs(directory)
+        path = os.path.join(directory, 'settings.json')
+        cases = [{'apiKeyHelper': SECRET}, {'env': {'ANTHROPIC_BASE_URL': SECRET}},
+                 {'nested': {'awsCredentialExport': SECRET}}, {'forceLoginOrgUUID': SECRET}]
+        for value in cases:
+            with self.subTest(value=list(value)):
+                with open(path, 'w') as fh:
+                    json.dump(value, fh)
+                fake = FakeClaude()
+                with self.assertRaises(coach.ClassifierUnavailable) as error:
+                    coach.classify(items(1), runner=fake, consent=True)
+                self.assertEqual(fake.calls, [])
+                self.assertNotIn(SECRET, str(error.exception))
+                self.assertNotIn(path, str(error.exception))
+
+    def test_disabled_mcp_configuration_is_not_a_first_party_provider_override(self):
+        directory = os.path.join(self.tmp.name, '.claude')
+        os.makedirs(directory)
+        with open(os.path.join(directory, 'settings.json'), 'w') as fh:
+            json.dump({'mcpServers': {'private-server': {'env': {'ANTHROPIC_API_KEY': SECRET}}}}, fh)
+        labels, _ = coach.classify(items(1), runner=FakeClaude(), consent=True)
+        self.assertEqual(len(labels), 1)
+        self.assertNotIn(SECRET, coach.classifier_environment().values())
+
+    def test_unreadable_profile_settings_fail_closed_without_content_or_path(self):
+        directory = os.path.join(self.tmp.name, '.claude')
+        os.makedirs(directory)
+        path = os.path.join(directory, 'settings.json')
+        with open(path, 'w') as fh:
+            fh.write('not-json ' + SECRET)
+        fake = FakeClaude()
+        with self.assertRaises(coach.ClassifierUnavailable) as error:
+            coach.classify(items(1), runner=fake, consent=True)
+        self.assertEqual(fake.calls, [])
+        self.assertNotIn(SECRET, str(error.exception))
+        self.assertNotIn(path, str(error.exception))
+
+    def test_managed_policy_refuses_even_before_the_capability_probe(self):
+        path = os.path.join(self.tmp.name, 'managed-settings.json')
+        with open(path, 'w') as fh:
+            json.dump({'env': {'ANTHROPIC_API_KEY': SECRET}}, fh)
+        fake = FakeClaude()
+        with mock.patch.object(coach, '_managed_policy_paths', return_value=[path]):
+            with self.assertRaises(coach.ClassifierUnavailable) as error:
+                coach.classify(items(1), runner=fake, consent=True)
+        self.assertEqual(fake.calls, [])
+        self.assertNotIn(path, str(error.exception))
+        self.assertNotIn(SECRET, str(error.exception))
+
+    def test_registry_managed_platform_is_not_silently_treated_as_an_unmanaged_profile(self):
+        fake = FakeClaude()
+        with mock.patch.object(coach, '_managed_policy_paths', self.real_policy_paths), mock.patch.object(coach.sys, 'platform', 'win32'):
+            with self.assertRaises(coach.ClassifierUnavailable):
+                coach.classify(items(1), runner=fake, consent=True)
+        self.assertEqual(fake.calls, [])
+
+    def test_failed_help_with_flag_names_still_refuses_before_account_or_prompt_dispatch(self):
+        fake = FakeClaude(help_rc=1)
+        with self.assertRaises(coach.ClassifierUnavailable):
+            coach.classify(items(1), runner=fake, consent=True)
+        self.assertEqual(fake.calls, [(['claude', '--help'], '')])
+
+    def test_signed_out_api_key_external_and_organization_auth_never_dispatch_prompts(self):
+        personal = {'loggedIn': True, 'authMethod': 'claude.ai', 'apiProvider': 'firstParty', 'subscriptionType': 'pro'}
+        for changes in ({'loggedIn': False}, {'authMethod': 'apiKey'}, {'apiProvider': 'bedrock'},
+                        {'subscriptionType': 'team'}, {'subscriptionType': None}):
+            with self.subTest(changes=changes):
+                fake = FakeClaude(auth={**personal, **changes, 'email': SECRET, 'token': SECRET})
+                with self.assertRaises(coach.ClassifierUnavailable) as error:
+                    coach.classify(items(1), runner=fake, consent=True)
+                self.assertEqual(len(fake.calls), 2)
+                self.assertTrue(all(not stdin for _, stdin in fake.calls))
+                self.assertNotIn(SECRET, str(error.exception))
+                argv = fake.calls[1][0]
+                self.assertEqual(argv[-3:], ['auth', 'status', '--json'])
+                self.assertIn('--safe-mode', argv)
+                self.assertEqual(argv[argv.index('--setting-sources') + 1], '')
+
+    def test_malformed_auth_metadata_is_not_echoed_or_treated_as_native_subscription(self):
+        def fake(argv, stdin, cwd=None):
+            return (0, HELP) if argv[1:] == ['--help'] else (0, SECRET)
+        with self.assertRaises(coach.ClassifierUnavailable) as error:
+            coach.classify(items(1), runner=fake, consent=True)
+        self.assertNotIn(SECRET, str(error.exception))
+
+    def test_environment_changed_after_auth_is_checked_again_before_prompt_dispatch(self):
+        fake = FakeClaude()
+        def changed(argv, stdin, cwd=None):
+            result = fake(argv, stdin, cwd)
+            if argv[-3:] == ['auth', 'status', '--json']:
+                os.environ['ANTHROPIC_API_KEY'] = SECRET
+            return result
+        with self.assertRaises(coach.ClassifierUnavailable):
+            coach.classify(items(1), runner=changed, consent=True)
+        self.assertEqual(len(fake.calls), 2)
+        self.assertTrue(all(not stdin for _, stdin in fake.calls))
 
 
 if __name__ == '__main__':

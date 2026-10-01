@@ -33,11 +33,32 @@ PYTHONPATH=src python3 -m anatomy scan
 | `anatomy scan` | The ledger: calls, tokens and list-price cost by tier, model and thread kind; input cost attributed by cause; cache rebuilds by cause; Codex process polls. |
 | `anatomy audit` | The scan plus every audit (boot scope, keep-alive, polls, oversized outputs, context clearing, break-even), each with at most one fix and whether it clears break-even at your prices. |
 | `anatomy card` | A numbers-only card: your top three fixes that clear break-even and the one evaluated trick that would have cost you money in replay. `--svg FILE` also writes it as an image, and `--shares-only` replaces every dollar amount with a share of the spend read. Below 20 threads or 5 sessions the card is marked do-not-share. |
-| `anatomy coach-baseline` | A personal correction-streak baseline for the EMILIA Session Coach: how often a Claude Code prompt is a correction after one correction, after two in a row, and otherwise, exported as the coach's `emilia.anatomy.coach.v1` import. Labels come from a labels file keyed by `--print-keys` (join keys and positions, never text), or, only with `--classify-with-claude --i-consent-to-send-prompts-to-my-claude`, from your own Claude account through the local `claude` CLI. Labels are estimates; prompt and session counts are observed. |
+| `anatomy coach-baseline` | A personal historical correction baseline for the EMILIA Session Coach, exported as `emilia.anatomy.coach.v1`. Labels come from a file keyed by `--print-keys` (join keys and positions, never text), or, with explicit consent, from an unmanaged first-party Claude Pro or Max subscription through the local `claude` CLI. The baseline uses a filtered prompt sequence, explained below. Labels are estimates; prompt and session counts are observed. |
 
 Common options: `--json`, `--until TIME` (ignore records after a UTC time, to pin a snapshot), `--no-claude`, `--no-codex`, `--claude-dir`, `--codex-dir`, `--workers`, and `--dedupe {global,file}` (default `global`: bill each message or response id once across all files; `file` reproduces per-file deduplication for comparison).
 
 Every number in the output ends with its basis: `[observed]` (transcript usage fields, times list price, and the published prices themselves), `[estimated]` (attribution, token-size estimates, and the cost of declined Claude Code fallback attempts, whose billing the pricing page does not state), `[modeled]` (counterfactual replays) or `[invoiced]` (vendor data, which Anatomy only has if you supply it). See [docs/method.md](docs/method.md).
+
+### Coach baseline
+
+This is a filtered historical association in Claude Code, not a control group or evidence that a recovery action works. `retry` and `nudge` labels are skipped: a correction, a retry, then another correction are adjacent in this baseline. `afterTwo` is a subset of `afterOne`. Unknown labels break the known history and never count as non-corrections. Copies preserve history but are not counted again. These definitions differ from the coach experiment's literal next-user-prompt sequence, where every prompt needs a label; do not treat the two rates as interchangeable.
+
+The text report includes unknown/skipped labels, read errors and failed classifier batches. The strict coach JSON envelope includes only the baseline's counts, denominators and classifier identifier; it omits that coverage detail. Retain the text report when evaluating an import. Truncation and unvalidated classifier labels can affect the rates; a successful live smoke proves integration, not classifier accuracy.
+
+The optional classifier supports unmanaged macOS or Linux profiles signed into a first-party Claude Pro or Max subscription. It refuses API credentials, custom provider/routing/runtime environment, provider helpers or settings, managed/cached policy files and unsupported CLI isolation flags before sending prompts. It does not silently remove a billing credential and switch accounts. Native auth status is checked without printing identity fields. Unsupported profiles can use `--labels`; no live model is used for that path.
+
+All classifier calls require safe mode, disabled tools and slash commands, an explicit empty MCP configuration, no saved session, empty user/project setting sources, and a replacement system prompt. `--bare` is not used because subscription OAuth must remain available. The child receives a small environment allowlist; unrelated API and GitHub credentials are excluded. Anatomy requests disabled nonessential client traffic and automatic attachments. This is not a guarantee about the CLI's inherent runtime traffic, provider storage or system/administrator policies.
+
+After signing in, a bounded smoke can use a directory containing only hand-written synthetic main-thread fixtures. Set `COACH_SMOKE_ROOT` to that directory and `COACH_PANEL_SESSION` to the session ID shown in the coach panel, then run from the clone:
+
+```sh
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python3 -m anatomy coach-baseline \
+  --claude-dir "$COACH_SMOKE_ROOT" --workers 1 \
+  --coach-session "$COACH_PANEL_SESSION" --coach-provider claude \
+  --classify-with-claude --i-consent-to-send-prompts-to-my-claude --json
+```
+
+This sends only the synthetic fixture's selected prompt excerpts and preceding reply tails as classifier input. It does not scan the default private transcript directory. A fixture result is test data, not a personal baseline. Before merging the live path, verify that it returns known labels, the expected public classifier identity, a valid envelope and a successful coach import; retain the fixture's text report for coverage.
 
 ## The break-even calculator
 
@@ -51,7 +72,7 @@ Regenerate `docs/calculator/prices.json` after a price update with `python3 scri
 
 ## Privacy
 
-- Runs entirely on your machine. Standard library only; no network calls. The one exception is `coach-baseline --classify-with-claude`, which refuses to run without its consent flag and then sends each prompt (cut to 1,500 characters) and the last 500 characters of the reply before it to your own Claude account through the local `claude` CLI, with tools and session saving off.
+- Standard library only. Anatomy makes no network calls itself. Its one model path is `coach-baseline --classify-with-claude`: after explicit consent and local profile/account checks, it provides each selected prompt (cut to 1,500 characters) and the preceding 500-character reply tail to the local `claude` CLI for first-party subscription classification. Tools, MCP, slash commands and session saving are disabled. The CLI and provider still govern their own runtime traffic, policies and storage.
 - Prints numbers and labels only. Prompt text, file contents, paths and commands never become labels. A tool name is printed only when it is on a fixed list of built-in Claude Code and Codex tools; any other tool name prints as `other` and every MCP tool as `mcp`, so your own tool, plugin and MCP server names stay out. Model ids print only when they look like public model names. Other labels are harness-defined words (attachment and message kinds) that pass a shape filter and a deny list.
 - Before printing, a gate walks the whole result and refuses any string that fails that shape filter or deny list, then scans the rendered text for secret, email, path and URL shapes (the two vendor pricing pages are the only URLs allowed). The gate is a shape check, not a vocabulary check; the allowlists above are what keep private names out.
 - Reads transcripts read-only and writes nothing unless you ask for `--svg FILE`, or `--out FILE` and `--save-labels FILE` with `coach-baseline`.

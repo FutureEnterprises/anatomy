@@ -393,9 +393,108 @@ def keys_lines(sessions) -> str:
 
 
 # ---------------------------------------------------------------- classifier
+_ENV_PREFIXES = ('ANTHROPIC_', 'CLAUDE_', 'CLAUDECODE', 'MCP_')
+_ENV_OVERRIDES = frozenset(('HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'NO_PROXY',
+                          'http_proxy', 'https_proxy', 'all_proxy', 'no_proxy',
+                          'SSL_CERT_FILE', 'SSL_CERT_DIR', 'SSLKEYLOGFILE', 'REQUESTS_CA_BUNDLE', 'CURL_CA_BUNDLE',
+                          'NODE_OPTIONS', 'NODE_PATH', 'NODE_EXTRA_CA_CERTS', 'NODE_TLS_REJECT_UNAUTHORIZED',
+                          'NODE_V8_COVERAGE', 'NODE_CHANNEL_FD', 'NODE_CHANNEL_SERIALIZATION_MODE',
+                          'NODE_REDIRECT_WARNINGS'))
+_ENV_KEEP = ('HOME', 'USER', 'LOGNAME', 'PATH', 'TMPDIR', 'LANG', 'LC_ALL',
+             'SYSTEMROOT', 'WINDIR', 'APPDATA', 'LOCALAPPDATA', 'USERPROFILE')
+_PROFILE_KEYS = frozenset(('apiKeyHelper', 'apiKey', 'baseUrl', 'anthropicApiKey', 'anthropicAuthToken',
+                         'anthropicBaseUrl', 'awsAuthRefresh', 'awsCredentialExport', 'otelHeadersHelper',
+                         'policyHelper', 'forceLoginMethod', 'forceLoginOrgUUID', 'env'))
+_SAFE_SETTINGS = '{"disableAllHooks":true,"autoMemoryEnabled":false}'
+_EMPTY_MCP = '{"mcpServers":{}}'
+_REQUIRED_CLAUDE_FLAGS = ('--print', '--model', '--output-format', '--no-session-persistence', '--tools',
+                          '--safe-mode', '--strict-mcp-config', '--mcp-config', '--disable-slash-commands',
+                          '--setting-sources', '--settings', '--system-prompt')
+
+
+def _populated(value) -> bool:
+    if isinstance(value, dict):
+        return any(_populated(v) for v in value.values())
+    if isinstance(value, list):
+        return any(_populated(v) for v in value)
+    return value not in (None, False, '')
+
+
+def _profile_override(value) -> bool:
+    if isinstance(value, dict):
+        return any((key in _PROFILE_KEYS and _populated(item)) or _profile_override(item)
+                   for key, item in value.items() if key != 'mcpServers')
+    return isinstance(value, list) and any(_profile_override(item) for item in value)
+
+
+def _managed_policy_paths(env: dict) -> list:
+    home = os.path.expanduser(env.get('HOME') or '~')
+    paths = [os.path.join(home, '.claude', name) for name in
+             ('managed-settings.json', 'remote-settings.json', 'managed-mcp.json')]
+    if sys.platform == 'darwin':
+        system = '/Library/Application Support/ClaudeCode'
+        paths.append('/Library/Managed Preferences/com.anthropic.claudecode.plist')
+        user = env.get('USER', '')
+        if re.fullmatch(r'[A-Za-z0-9._-]+', user):
+            paths.append('/Library/Managed Preferences/%s/com.anthropic.claudecode.plist' % user)
+    elif sys.platform == 'win32':
+        # Registry-managed policies are not characterized by this small adapter.
+        raise ClassifierUnavailable('the subscription classifier currently supports unmanaged macOS or Linux profiles; use --labels')
+    else:
+        system = '/etc/claude-code'
+    paths += [os.path.join(system, name) for name in ('managed-settings.json', 'managed-mcp.json')]
+    fragments = os.path.join(system, 'managed-settings.d')
+    try:
+        names = os.listdir(fragments)
+    except FileNotFoundError:
+        names = []
+    except OSError:
+        raise ClassifierUnavailable('managed Claude policy could not be checked; use --labels') from None
+    if len(names) > 100:
+        raise ClassifierUnavailable('managed Claude policy could not be checked; use --labels')
+    paths += [os.path.join(fragments, name) for name in names if name.endswith('.json')]
+    return paths
+
+
+def classifier_environment() -> dict:
+    """Refuse account/routing overrides, then pass only basic native-client environment.
+
+    No values or raw configuration/auth metadata belong in an error. In particular,
+    deleting an API key and silently using another billing identity is not a fallback.
+    """
+    env = os.environ
+    if any(value and (name.startswith(_ENV_PREFIXES) or name in _ENV_OVERRIDES) for name, value in env.items()):
+        raise ClassifierUnavailable('custom Claude provider, authentication or runtime environment is not supported; use --labels or an unmodified signed-in subscription profile')
+    safe = {name: env[name] for name in _ENV_KEEP if name in env}
+    home = os.path.expanduser(safe.get('HOME') or '~')
+    for path in _managed_policy_paths(safe):
+        if os.path.lexists(path):
+            raise ClassifierUnavailable('managed or remotely cached Claude policy is not supported by this classifier; use --labels')
+    for name in ('settings.json', 'settings.local.json'):
+        path = os.path.join(home, '.claude', name)
+        try:
+            with open(path, 'rb') as fh:
+                raw = fh.read(131073)
+        except FileNotFoundError:
+            continue
+        except OSError:
+            raise ClassifierUnavailable('Claude profile settings could not be checked; use --labels') from None
+        try:
+            value = json.loads(raw) if len(raw) <= 131072 else None
+        except (ValueError, UnicodeDecodeError):
+            value = None
+        if not isinstance(value, dict) or _profile_override(value):
+            raise ClassifierUnavailable('custom or unreadable Claude provider settings are not supported; use --labels')
+    safe.update({'TERM': 'dumb', 'NO_COLOR': '1', 'CLAUDE_CODE_DISABLE_ATTACHMENTS': '1',
+                 'CLAUDE_CODE_DISABLE_AUTO_MEMORY': '1', 'CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC': '1',
+                 'CLAUDE_CODE_DISABLE_BACKGROUND_TASKS': '1', 'CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL': '1'})
+    return safe
+
+
 def run_process(argv: list, stdin_text: str, cwd: str | None = None) -> tuple[int, str]:
     """Default runner: a local process. Tests inject their own, so they never call the real CLI."""
-    p = subprocess.run(argv, input=stdin_text, capture_output=True, text=True, timeout=TIMEOUT_S, cwd=cwd)
+    p = subprocess.run(argv, input=stdin_text, capture_output=True, text=True, timeout=TIMEOUT_S, cwd=cwd,
+                       env=classifier_environment())
     return p.returncode, p.stdout
 
 
@@ -405,9 +504,8 @@ def _has_flag(help_text: str, flag: str) -> bool:
 
 def claude_argv(runner, cwd=None, exe: str = CLAUDE_EXE) -> tuple[list, bool]:
     """argv for one non-interactive classifier call, from what this claude CLI's --help lists:
-    print mode, model haiku, JSON output, no saved session (so the calls never become transcripts that a
-    later scan reads), and no tools. Safe mode (no hooks, MCP servers, skills or CLAUDE.md) and a replacement
-    system prompt are used when available. -> (argv, instruction goes in the system prompt)"""
+    Every isolation flag is mandatory; unsupported clients fail before prompt dispatch.
+    -> (argv, instruction goes in the system prompt)."""
     try:
         rc, help_text = runner([exe, '--help'], '', cwd)
     except FileNotFoundError:
@@ -415,17 +513,30 @@ def claude_argv(runner, cwd=None, exe: str = CLAUDE_EXE) -> tuple[list, bool]:
     except Exception as e:
         raise ClassifierUnavailable('claude --help failed (%s)' % type(e).__name__)
     help_text = help_text or ''
-    for flag in ('--print', '--model', '--output-format', '--no-session-persistence', '--tools'):
+    if rc != 0:
+        raise ClassifierUnavailable('claude --help did not succeed; no prompts sent')
+    for flag in _REQUIRED_CLAUDE_FLAGS:
         if not _has_flag(help_text, flag):
             raise ClassifierUnavailable('this claude CLI does not list %s; update it' % flag)
     argv = [exe, '-p', '--model', MODEL, '--output-format', 'json', '--no-session-persistence', '--tools', '']
-    for flag in ('--safe-mode', '--strict-mcp-config', '--disable-slash-commands'):
-        if _has_flag(help_text, flag):
-            argv.append(flag)
-    system = _has_flag(help_text, '--system-prompt')
-    if system:
-        argv += ['--system-prompt', INSTRUCTION]
-    return argv, system
+    argv += ['--safe-mode', '--strict-mcp-config', '--mcp-config', _EMPTY_MCP,
+             '--disable-slash-commands', '--setting-sources', '', '--settings', _SAFE_SETTINGS,
+             '--system-prompt', INSTRUCTION]
+    return argv, True
+
+
+def personal_account(runner, cwd, exe: str):
+    """Check local client metadata only. Never return/log its raw identity or auth fields."""
+    try:
+        rc, raw = runner([exe, '--safe-mode', '--setting-sources', '', '--settings', _SAFE_SETTINGS,
+                          'auth', 'status', '--json'], '', cwd)
+        status = json.loads(raw)
+    except Exception:
+        raise ClassifierUnavailable('could not verify a signed-in first-party Claude subscription; use --labels') from None
+    if (rc != 0 or not isinstance(status, dict) or status.get('loggedIn') is not True
+            or status.get('authMethod') != 'claude.ai' or status.get('apiProvider') != 'firstParty'
+            or status.get('subscriptionType') not in ('pro', 'max')):
+        raise ClassifierUnavailable('sign in to an unmanaged first-party Claude Pro or Max subscription before classifying; no prompts sent')
 
 
 class BatchFailed(Exception):
@@ -506,6 +617,7 @@ def classify(prompts: list, runner=None, exe: str = CLAUDE_EXE, *, consent: bool
     prompts unknown; a missing item leaves that prompt unknown."""
     if consent is not True:
         raise Refusal('classifying prompts with the claude CLI needs --i-consent-to-send-prompts-to-my-claude')
+    classifier_environment()  # Also required for injected runners, before even a metadata probe.
     runner = runner or run_process
     batches = [prompts[i:i + BATCH] for i in range(0, len(prompts), BATCH)]
     stats = {'batches': len(batches), 'failed_batches': 0, 'failures': collections.Counter(), 'models': set()}
@@ -514,8 +626,10 @@ def classify(prompts: list, runner=None, exe: str = CLAUDE_EXE, *, consent: bool
         return labels, stats
     with tempfile.TemporaryDirectory(prefix='anatomy-classify-') as cwd:
         argv, system = claude_argv(runner, cwd, exe)
+        personal_account(runner, cwd, exe)
 
         def one(batch):
+            classifier_environment()  # Recheck immediately before dispatch, including injected runners.
             try:
                 rc, out = runner(argv, batch_input(batch, system), cwd)
             except subprocess.TimeoutExpired:
@@ -638,8 +752,8 @@ def _main(args, until_epoch, until_iso) -> int:
     else:
         todo = unique_prompts(sessions)
         nb = (len(todo) + BATCH - 1) // BATCH
-        sys.stderr.write('anatomy: sending %s prompts (each cut to %s characters, with the last %d characters of the reply before it) '
-                         'to your own Claude account through the local claude CLI, model %s, in %d batches; nothing else is sent.\n'
+        sys.stderr.write('anatomy: requesting classification of %s prompt excerpts (each cut to %s characters, with the last %d characters of the reply before it) '
+                         'through the local claude CLI, model %s, in %d batches; local profile and account checks precede prompt dispatch.\n'
                          % (format(len(todo), ','), format(PROMPT_CHARS, ','), TAIL_CHARS, MODEL, nb))
         labels, st = classify(todo, consent=args.i_consent_to_send_prompts_to_my_claude is True)
         batches, failed = st['batches'], st['failed_batches']
