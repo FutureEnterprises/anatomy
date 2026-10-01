@@ -33,6 +33,7 @@ PYTHONPATH=src python3 -m anatomy scan
 | `anatomy scan` | The ledger: calls, tokens and list-price cost by tier, model and thread kind; input cost attributed by cause; cache rebuilds by cause; Codex process polls. |
 | `anatomy audit` | The scan plus every audit (boot scope, keep-alive, polls, oversized outputs, context clearing, break-even), each with at most one fix and whether it clears break-even at your prices. |
 | `anatomy card` | A numbers-only card: your top three fixes that clear break-even and the one evaluated trick that would have cost you money in replay. `--svg FILE` also writes it as an image, and `--shares-only` replaces every dollar amount with a share of the spend read. Below 20 threads or 5 sessions the card is marked do-not-share. |
+| `anatomy coach-baseline` | A personal correction-streak baseline for the EMILIA Session Coach: how often a Claude Code prompt is a correction after one correction, after two in a row, and otherwise, exported as the coach's `emilia.anatomy.coach.v1` import. Labels come from a labels file keyed by `--print-keys` (join keys and positions, never text), or, only with `--classify-with-claude --i-consent-to-send-prompts-to-my-claude`, from your own Claude account through the local `claude` CLI. Labels are estimates; prompt and session counts are observed. |
 
 Common options: `--json`, `--until TIME` (ignore records after a UTC time, to pin a snapshot), `--no-claude`, `--no-codex`, `--claude-dir`, `--codex-dir`, `--workers`, and `--dedupe {global,file}` (default `global`: bill each message or response id once across all files; `file` reproduces per-file deduplication for comparison).
 
@@ -50,10 +51,10 @@ Regenerate `docs/calculator/prices.json` after a price update with `python3 scri
 
 ## Privacy
 
-- Runs entirely on your machine. Standard library only; no network calls.
+- Runs entirely on your machine. Standard library only; no network calls. The one exception is `coach-baseline --classify-with-claude`, which refuses to run without its consent flag and then sends each prompt (cut to 1,500 characters) and the last 500 characters of the reply before it to your own Claude account through the local `claude` CLI, with tools and session saving off.
 - Prints numbers and labels only. Prompt text, file contents, paths and commands never become labels. A tool name is printed only when it is on a fixed list of built-in Claude Code and Codex tools; any other tool name prints as `other` and every MCP tool as `mcp`, so your own tool, plugin and MCP server names stay out. Model ids print only when they look like public model names. Other labels are harness-defined words (attachment and message kinds) that pass a shape filter and a deny list.
 - Before printing, a gate walks the whole result and refuses any string that fails that shape filter or deny list, then scans the rendered text for secret, email, path and URL shapes (the two vendor pricing pages are the only URLs allowed). The gate is a shape check, not a vocabulary check; the allowlists above are what keep private names out.
-- Reads transcripts read-only and writes nothing unless you ask for `--svg FILE`.
+- Reads transcripts read-only and writes nothing unless you ask for `--svg FILE`, or `--out FILE` and `--save-labels FILE` with `coach-baseline`.
 
 ## Prices
 

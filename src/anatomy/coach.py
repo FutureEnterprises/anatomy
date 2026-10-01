@@ -20,10 +20,13 @@ marker, not from a non-human origin (task notifications), and not empty once
 XML-like tag blocks (system reminders, task notifications, bash input) are
 removed. Its key is sha256 over the UTF-8 of the prompt text (tag blocks
 removed, outer whitespace stripped), one NUL, and the last 500 characters of the
-assistant text written before it in the same file. A prompt whose key already
-appeared in a file whose last record is older (history copied into a resumed or
-forked session) is not counted again; it stays in its session's sequence as the
-previous prompt of whatever follows it, as copied responses do in the ledger.
+assistant text written before it in the same file. A prompt is a copy, and not
+counted again, when its record uuid already appeared (earlier in the same file,
+or in a file whose last record is older) or its key already appeared in such an
+older file: history copied into a resumed or forked session, or replayed into the
+same file. A copy keeps the label of the record it copies and stays in its
+session's sequence as the previous prompt of whatever follows it, as copied
+responses do in the ledger.
 """
 from __future__ import annotations
 
@@ -177,7 +180,9 @@ def read_session(path: str, until: float | None = None) -> dict:
             elif t == 'user':
                 text = prompt_text(o)
                 if text is not None:
-                    prompts.append({'key': prompt_key(text, tail), 'text': text[:PROMPT_CHARS], 'tail': tail, 'copied': False})
+                    u = o.get('uuid')
+                    prompts.append({'key': prompt_key(text, tail), 'text': text[:PROMPT_CHARS], 'tail': tail, 'copied': False,
+                                    'uuid': u if isinstance(u, str) and u else None})
     return {'prompts': prompts, 'first_ts': first_ts, 'last_ts': last_ts}
 
 
@@ -192,7 +197,9 @@ def _read_job(job):
 
 def collect(root: str, until: float | None = None, workers: int = 1):
     """-> (sessions, read errors by type). Main-thread transcripts only. Sessions are ordered by their last
-    record, oldest first; a prompt whose key appeared in an earlier session is marked copied."""
+    record, oldest first. A prompt is marked copied when its record uuid appeared before (in an earlier
+    session or earlier in its own file; it then takes the key, and so the label, of that first record)
+    or its key appeared in an earlier session. Record uuids are dropped once compared."""
     files = [p for p, kind in claude_ingest.discover(root) if kind == 'main'] if os.path.isdir(root) else []
     jobs = [(p, until) for p in files]
     if workers > 1 and len(jobs) > 1:
@@ -204,10 +211,18 @@ def collect(root: str, until: float | None = None, workers: int = 1):
     sessions = [dict(s, path=p) for p, s, err in results if s is not None and s['prompts']]
     sessions.sort(key=lambda s: (s['last_ts'] is None, s['last_ts'] or 0, s['path']))
     seen: set = set()
+    first_key: dict = {}
     for s in sessions:
         own = set()
         for p in s['prompts']:
-            p['copied'] = p['key'] in seen
+            u = p.pop('uuid', None)
+            if u is not None and u in first_key:
+                p['copied'] = True
+                p['key'] = first_key[u]
+            else:
+                p['copied'] = p['key'] in seen
+                if u is not None:
+                    first_key[u] = p['key']
             own.add(p['key'])
         seen |= own
     return sessions, errors
@@ -337,8 +352,12 @@ def read_labels(path: str) -> dict:
     """JSONL lines {"key": <64 hex>, "label": <label>}; other fields (a joined --print-keys line) are ignored.
     A key given two different labels is refused."""
     labels: dict = {}
-    with open(path, encoding='utf-8') as fh:
-        for n, line in enumerate(fh, 1):
+    with open(path, encoding='utf-8', errors='strict') as fh:
+        try:
+            lines = list(fh)
+        except UnicodeDecodeError:
+            raise Refusal('labels file is not UTF-8')
+        for n, line in enumerate(lines, 1):
             if not line.strip():
                 continue
             try:
@@ -357,11 +376,14 @@ def read_labels(path: str) -> dict:
 
 
 def keys_lines(sessions) -> str:
-    """--print-keys: one JSON line per counted (not copied) prompt: key, session ordinal, prompt index."""
-    out = []
+    """--print-keys: one JSON line per distinct key among counted (not copied) prompts, at its first
+    occurrence: key, session ordinal, prompt index. A key repeated in one session is listed once, so a
+    labels file never has to give it twice."""
+    out, seen = [], set()
     for n, s in enumerate(sessions, 1):
         for i, p in enumerate(s['prompts']):
-            if not p['copied']:
+            if not p['copied'] and p['key'] not in seen:
+                seen.add(p['key'])
                 out.append(json.dumps({'key': p['key'], 'session': n, 'index': i}))
     text = '\n'.join(out) + ('\n' if out else '')
     for ln in out:   # keys and positions, nothing else
@@ -478,9 +500,12 @@ def batch_input(batch: list, system: bool) -> str:
     return body if system else INSTRUCTION + '\n\n' + body
 
 
-def classify(prompts: list, runner=None, exe: str = CLAUDE_EXE) -> tuple[dict, dict]:
+def classify(prompts: list, runner=None, exe: str = CLAUDE_EXE, *, consent: bool = False) -> tuple[dict, dict]:
     """Label unique prompts with the local claude CLI, BATCH per call. -> (labels by key, stats).
-    A failed or unparseable batch leaves all its prompts unknown; a missing item leaves that prompt unknown."""
+    Refuses before running anything unless consent is True. A failed or unparseable batch leaves all its
+    prompts unknown; a missing item leaves that prompt unknown."""
+    if consent is not True:
+        raise Refusal('classifying prompts with the claude CLI needs --i-consent-to-send-prompts-to-my-claude')
     runner = runner or run_process
     batches = [prompts[i:i + BATCH] for i in range(0, len(prompts), BATCH)]
     stats = {'batches': len(batches), 'failed_batches': 0, 'failures': collections.Counter(), 'models': set()}
@@ -547,6 +572,8 @@ def render_text(summary: dict) -> str:
         L.append('  classifier batches failed: %s of %s; their prompts are unknown  [observed]' % (s['failed_batches'], s['batches']))
     L.append('  not counted: first prompt %s, retry or nudge %s, unknown label %s, after an unknown label %s, no earlier counted prompt %s  [estimated]' % (
         sk['first_prompt'], sk['retry_or_nudge'], sk['unknown_label'], sk['after_unknown'], sk['no_previous']))
+    if sk['after_two_unknown']:
+        L.append('  left out of after two corrections only, label two back unknown: %s  [estimated]' % sk['after_two_unknown'])
     for k, name in (('afterOne', 'after one correction'), ('afterTwo', 'after two corrections'), ('otherwise', 'otherwise')):
         c, o = b[k]['corrections'], b[k]['observed']
         L.append('  next prompt is a correction, %-22s %6s  (%s of %s)  [estimated]' % (name, _pct(c, o), format(c, ','), format(o, ',')))
@@ -569,6 +596,12 @@ def main(args, until_epoch=None, until_iso=None) -> int:
     except PrivacyError as e:
         sys.stderr.write('anatomy: output withheld by the privacy gate (%s)\n' % e)
         return 3
+    except OSError as e:   # the message would carry a path: give the type only
+        sys.stderr.write('anatomy: could not read or write a file (%s)\n' % type(e).__name__[:40])
+        return 2
+    except Exception as e:   # never a traceback: it could carry transcript text or a path
+        sys.stderr.write('anatomy: coach-baseline failed (%s)\n' % type(e).__name__[:40])
+        return 1
 
 
 def _main(args, until_epoch, until_iso) -> int:
@@ -608,7 +641,7 @@ def _main(args, until_epoch, until_iso) -> int:
         sys.stderr.write('anatomy: sending %s prompts (each cut to %s characters, with the last %d characters of the reply before it) '
                          'to your own Claude account through the local claude CLI, model %s, in %d batches; nothing else is sent.\n'
                          % (format(len(todo), ','), format(PROMPT_CHARS, ','), TAIL_CHARS, MODEL, nb))
-        labels, st = classify(todo)
+        labels, st = classify(todo, consent=args.i_consent_to_send_prompts_to_my_claude is True)
         batches, failed = st['batches'], st['failed_batches']
         if batches and failed == batches:
             raise Refusal('every classifier batch failed (%s); nothing written' % ', '.join(sorted(st['failures'])))
