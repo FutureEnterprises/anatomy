@@ -673,7 +673,9 @@ def render_text(summary: dict) -> str:
     """Lines starting with '#' are metadata. Every other line with a number ends with its basis."""
     s = summary
     b, lab, sk = s['baseline'], s['labels'], s['skipped']
-    L = ['# Anatomy %s coach baseline (%s) for the EMILIA Session Coach, %s client.' % (s['anatomy_version'], FORMAT, s['coach_provider']),
+    head = ('# Anatomy %s coach baseline (%s) for the EMILIA Session Coach, %s client.' % (s['anatomy_version'], FORMAT, s['coach_provider'])
+            if s['coach_provider'] else '# Anatomy %s correction-streak baseline.' % s['anatomy_version'])
+    L = [head,
          '# Bases: [observed] read from transcripts; [estimated] depends on prompt labels, which are estimates.']
     if s.get('until'):
         L.append('# Records after %s UTC are ignored.' % s['until'])
@@ -691,7 +693,8 @@ def render_text(summary: dict) -> str:
     for k, name in (('afterOne', 'after one correction'), ('afterTwo', 'after two corrections'), ('otherwise', 'otherwise')):
         c, o = b[k]['corrections'], b[k]['observed']
         L.append('  next prompt is a correction, %-22s %6s  (%s of %s)  [estimated]' % (name, _pct(c, o), format(c, ','), format(o, ',')))
-    L.append('# --json prints the coach import and --out FILE writes it: these counts, the classifier name and the coach session id.')
+    L.append('# --json prints the coach import and --out FILE writes it: these counts, the classifier name and the coach session id.'
+             if s['coach_provider'] else '# For the coach import, add --coach-session ID --coach-provider CLIENT with --json or --out.')
     return '\n'.join(L) + '\n'
 
 
@@ -719,10 +722,13 @@ def main(args, until_epoch=None, until_iso=None) -> int:
 
 
 def _main(args, until_epoch, until_iso) -> int:
+    # The coach import (--json, --out) names a coach session and client. Without them the command
+    # prints only the personal text summary, so anyone can read their own streak numbers.
+    coach_mode = bool(args.json or args.out or args.coach_session or args.coach_provider)
     if not args.print_keys:
-        if not args.coach_session or not SESSION_ID.match(args.coach_session):
+        if coach_mode and (not args.coach_session or not SESSION_ID.match(args.coach_session)):
             raise Refusal('--coach-session must be the coach session id shown in the panel (letters, digits, - and _, at most 80)')
-        if not args.coach_provider:
+        if coach_mode and not args.coach_provider:
             raise Refusal('--coach-provider is required: %s' % ', '.join(COACH_PROVIDERS))
         if not (args.labels or args.classify_with_claude):
             raise Refusal('choose a label source: --labels FILE or --classify-with-claude')
@@ -768,8 +774,7 @@ def _main(args, until_epoch, until_iso) -> int:
     if t['promptCount'] < 1:
         raise Refusal('no user prompts found in main-thread Claude Code sessions; nothing written')
     base = baseline(t, classifier)
-    env = envelope(args.coach_session, args.coach_provider, base)
-    out_json = export_json(env)
+    out_json = export_json(envelope(args.coach_session, args.coach_provider, base)) if coach_mode else None
     summary = {'anatomy_version': __version__, 'coach_provider': args.coach_provider, 'until': until_iso,
                'baseline': base, 'labels': t['labels'], 'skipped': t['skipped'], 'copied': t['copied'],
                'read_errors': sum(errors.values()), 'batches': batches, 'failed_batches': failed}
