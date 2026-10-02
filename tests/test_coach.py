@@ -202,6 +202,20 @@ class Contract(Base):
             self.assertEqual(code, 2, argv)
             self.assertEqual(out, '')
 
+    def test_personal_summary_needs_no_coach_session(self):
+        self.t.write('a', conversation(['new a', 'correction b', 'correction c', 'new d']))
+        code, out, err = run('--claude-dir', self.root, '--labels', self.labels_file(by_prefix))
+        self.assertEqual(code, 0, err)
+        self.assertIn('correction-streak baseline', out)
+        self.assertIn('next prompt is a correction, after one correction', out)
+        self.assertNotIn('"format"', out)
+
+    def test_coach_import_still_requires_the_session(self):
+        for extra in (['--json'], ['--out', os.path.join(self.tmp.name, 'x.json')]):
+            code, out, err = run('--claude-dir', self.root, '--labels', 'x', *extra)
+            self.assertEqual(code, 2, extra)
+            self.assertEqual(out, '')
+
     def test_no_prompts_is_a_refusal(self):
         lab = os.path.join(self.tmp.name, 'empty.jsonl')
         open(lab, 'w').close()
