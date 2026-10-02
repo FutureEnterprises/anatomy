@@ -7,6 +7,10 @@
           the one evaluated trick that would have cost you money (text, JSON or SVG)
   coach-baseline
           a personal correction-streak baseline for the EMILIA Session Coach (coach.py)
+  correction-index
+          literal correction patterns and individually priced response calls
+  correction-audit
+          compare saved machine labels with local human reviews
 
 Nothing is sent anywhere, except that `coach-baseline --classify-with-claude`, given
 its consent flag, sends prompts to the user's own Claude account through the local
@@ -544,7 +548,39 @@ def main(argv=None) -> int:
     b.add_argument('--out', metavar='FILE', help='write the coach import (or, with --print-keys, the keys) to FILE')
     b.add_argument('--json', action='store_true', help='print the coach import instead of the summary')
     b.add_argument('--workers', type=int, default=0, help='worker processes for reading (default: CPU count - 1)')
+    ix = sub.add_parser('correction-index', help='personal correction patterns and API-equivalent spend following prompts')
+    ix.add_argument('--claude-dir', help='Claude Code projects directory (default ~/.claude/projects)')
+    ix.add_argument('--until', help='pin the transcript cutoff to an ISO time (UTC if no offset)')
+    ix.add_argument('--labels', metavar='FILE', help='saved JSONL key/label pairs; omitted labels stay unknown')
+    ix.add_argument('--classifier-id', metavar='ID', help='identifier of the saved labeler')
+    ix.add_argument('--reviews', metavar='FILE', help='optionally attach an audit against saved human key/label reviews')
+    export = ix.add_mutually_exclusive_group()
+    export.add_argument('--print-keys', action='store_true', help='print opaque classifier keys and positions only')
+    export.add_argument('--sample', type=int, metavar='N', help='export a simple random sample manifest for human review')
+    ix.add_argument('--seed', type=int, default=20261001, help='fixed human-audit sampling seed')
+    ix.add_argument('--json', action='store_true', help='print the aggregate report as JSON')
+    ix.add_argument('--out', metavar='FILE', help='save the JSON report, key list or sample manifest')
+    ix.add_argument('--anthropic-prices', help=argparse.SUPPRESS)
+    la = sub.add_parser('correction-audit', help='audit machine correction labels against independent human reviews')
+    la.add_argument('--labels', metavar='FILE', required=True, help='machine key/label JSONL')
+    la.add_argument('--reviews', metavar='FILE', required=True, help='human key/label JSONL; no prompt text')
+    la.add_argument('--classifier-id', default='labels-file', metavar='ID')
+    la.add_argument('--json', action='store_true')
+    la.add_argument('--out', metavar='FILE', help='save the numbers-only audit as JSON')
+    rv = sub.add_parser('correction-review', help='review a random prompt sample in a private loopback browser')
+    rv.add_argument('--claude-dir', help='Claude Code projects directory (default ~/.claude/projects)')
+    rv.add_argument('--until', help='pin the transcript cutoff to an ISO time')
+    rv.add_argument('--sample', type=int, default=40, metavar='N', help='number of unique classifier inputs to review')
+    rv.add_argument('--seed', type=int, default=20261001)
+    rv.add_argument('--out', required=True, metavar='FILE', help='new private JSONL file for opaque keys and human labels')
+    rv.add_argument('--port', type=int, default=0, help='loopback port; default chooses a free port')
     args = ap.parse_args(argv)
+    if args.cmd == 'correction-review':
+        from . import correction_review
+        return correction_review.main(args)
+    if args.cmd in ('correction-index', 'correction-audit'):
+        from . import index_cli
+        return index_cli.main(args)
     if args.cmd == 'coach-baseline':
         try:
             until_epoch, until_iso = _parse_until(args.until)
